@@ -40,8 +40,10 @@ Windows 的 venv 靠 `pyvenv.cfg` 里的 `home` 找基座解释器。启动器�
     python scripts/build_dist.py --no-zip           # 只构建到构建目录
     python scripts/build_dist.py --stage D:\\tmp     # 换构建目录（务必用短路径）
 
-构建目录默认 `C:\\_akasha_dist`，**必须短**：venv 有近 5 万个小文件，
-放在深目录会撞 Windows 的 260 字符路径上限。
+构建目录默认 `build/`（项目内，路径最短的可用位置）：venv 有近 5 万个小文件，
+放在深目录会撞 Windows 的 260 字符路径上限（本机未开长路径支持）。
+打包成功后**自动删除** stage 目录，只留 `release/dist/*.zip`，不在项目外留残留。
+（真撞上限时用 `--stage` 换更短的盘符根目录，例如 `--stage C:\\_mb_dist`。）
 """
 
 import argparse
@@ -70,7 +72,7 @@ RT_ASTRBOT = os.path.join(ROOT, "runtime", "astrbot")
 RT_BRIDGE = os.path.join(ROOT, "runtime", "bridge")
 VENDOR = os.path.join(ROOT, "vendor")
 RELEASE_DIST = os.path.join(ROOT, "release", "dist")
-DEFAULT_STAGE = r"C:\_akasha_dist"
+DEFAULT_STAGE = os.path.join(ROOT, "build")
 
 # 项目名称（2026-10-19 起）—— 发行版 zip 与包内目录名都用它
 PROJECT_CODE = "Mon3trBot_Remake"
@@ -103,7 +105,8 @@ SKIP_FILE_NAMES = {".kb_api_key", "astrbot.lock", "bridge.pid"}
 # 桥接要从源码副本带过去的文件（发布副本才是"干净源"）
 # ⚠️ 新增桥接模块时必须同步加到这里，否则发行版会缺文件
 #    （2026-09-18 踩过：astrbot_ctl.py 漏加 → 面板「重启 AstrBot」按钮在收件人那里直接报错）
-BRIDGE_FILES = ["main.py", "bridge_core.py", "ob_client.py", "ob_protocol.py",
+BRIDGE_FILES = ["main.py", "bridge_core.py", "message_source.py",
+                "wx_msg_parser.py", "ob_client.py", "ob_protocol.py",
                 "people.py", "senders.py", "state.py", "uia_sender.py",
                 "web_panel.py", "config.py", "astrbot_ctl.py", "exit_reason.py",
                 "requirements.txt",
@@ -303,6 +306,34 @@ def rmtree_fast(path):
         pass
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
+
+
+# Windows MAX_PATH：260 含结尾 NUL，所以可用 259。本机 LongPathsEnabled=0。
+MAX_PATH = 259
+
+
+def _longest_rel(root):
+    """返回 root 下最长的相对路径长度（不含 root 本身，含前导分隔符）。"""
+    worst = 0
+    for base, dirs, fs in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIR]
+        for f in fs:
+            worst = max(worst, len(base) - len(root) + 1 + len(f))
+    return worst
+
+
+def check_path_budget(stage_root, src_dirs):
+    """复制前先算最坏路径长度，撞 MAX_PATH 就直接拒绝，别让 robocopy 半途报错。"""
+    worst_rel = max((_longest_rel(d) for d in src_dirs if os.path.isdir(d)),
+                    default=0)
+    worst = len(stage_root) + worst_rel
+    log(f"  路径预算: stage {len(stage_root)} + 最长相对 {worst_rel}"
+        f" = {worst} 字符（上限 {MAX_PATH}）")
+    if worst > MAX_PATH:
+        raise SystemExit(
+            f"❌ 路径太长（{worst} > {MAX_PATH}）：{stage_root}\n"
+            f"   请用更短的构建目录，例如 `--stage C:\\_mb_dist`"
+            f"（或开启 Windows 长路径支持）。")
 
 
 def _walk_stats(root):
@@ -880,8 +911,10 @@ AstrBot 只在**启动时**读一次配置。改完必须重启——面板上�
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default=DEFAULT_STAGE,
-                    help="构建目录（请用短路径，默认 C:\\_akasha_dist）")
+                    help="构建目录（请用短路径，默认项目内 build/）")
     ap.add_argument("--no-zip", action="store_true")
+    ap.add_argument("--keep-stage", action="store_true",
+                    help="打包后保留 stage 目录（默认自动删除）")
     args = ap.parse_args()
 
     ver = version()
@@ -894,17 +927,20 @@ def main():
     log(f"  基座 Python: {base_python_dir()}")
 
     if os.path.isdir(stage):
-        aside = stage.rstrip("\\/") + f"_old_{datetime.now():%H%M%S}"
-        try:
-            os.rename(stage, aside)
-            log(f"  旧构建目录 → {aside}（可稍后删）")
-        except OSError as e:
-            log(f"  ⚠️ 改名失败（{e}），直接复用")
+        # 上次构建的残留（正常流程会自动删，这里兜失败的构建）。
+        # 不再改名成 _old_HHMMSS —— 那会在项目外越攒越多。
+        n_stale, b_stale = _walk_stats(stage)
+        log(f"  清理上次构建残留：{n_stale} 文件 / {b_stale/1024/1024:.0f} MB")
+        rmtree_fast(stage)
+        if os.path.isdir(stage):
+            raise SystemExit(f"❌ 无法清理残留的构建目录（可能被占用）：{stage}")
     os.makedirs(stage, exist_ok=True)
 
     py_src = base_python_dir()
     ab_venv_src = os.path.join(RT_ASTRBOT, ".venv")
     br_venv_src = os.path.join(RT_BRIDGE, ".venv")
+
+    check_path_budget(stage, [py_src, ab_venv_src, br_venv_src, CODE_DIR])
 
     # ---------- 1. 基座 Python ----------
     hr("1/7 复制免安装 Python")
@@ -1100,6 +1136,20 @@ def main():
         sz = os.path.getsize(zip_path) / 1024 / 1024
         log(f"  {total} 文件 / {sz:.0f} MB / {time.time()-t0:.0f}s")
         log(f"  {zip_path}")
+
+    # ---------- stage 清理 ----------
+    # zip 已经出来了，stage 只是中间产物：删掉，免得四处攒解压副本。
+    # --no-zip / --keep-stage 时保留，便于排查（如检查脱敏后的实际内容）。
+    if zip_path and not args.keep_stage:
+        hr("清理 stage（zip 已生成）")
+        n_s, b_s = _walk_stats(stage)
+        rmtree_fast(stage)
+        if os.path.isdir(stage):
+            log(f"  ⚠️ stage 未能完全删除，请手动清理：{stage}")
+        else:
+            log(f"  已删除 {stage}（{n_s} 文件 / {b_s/1024/1024:.0f} MB）")
+    elif not args.no_zip:
+        log(f"  保留 stage（--keep-stage）：{stage}")
 
     log(f"\n✅ 发行版构建完成（总耗时 {time.time()-t00:.0f}s）")
     return 0

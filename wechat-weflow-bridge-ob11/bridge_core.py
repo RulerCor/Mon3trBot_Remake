@@ -24,7 +24,7 @@ import requests
 import state
 import config
 import wx_msg_parser
-from message_source import create_message_source
+from message_source import create_message_source, extract_media_url, extract_message_id
 from ob_protocol import push_event, make_message_event
 
 log = logging.getLogger("ob11-bridge")
@@ -873,47 +873,62 @@ class WeFlowBridge:
             self._sse_session = None
 
     def _fetch_image_base64(self, data) -> str | None:
-        """从 WeFlow 取图并返回 base64（不落盘，避免图片文件堆积）。
+        """取得图片字节并返回 base64。
 
-        优先按 rawid 精确匹配：同一会话可能连着来多张图，只认「最新一张」会串图。
-        图片大小超过 config.IMAGE_MAX_BYTES 时跳过（AstrBot 侧还有压缩，这里只挡异常大图）。
+        顺序：
+          1. SSE/历史事件已经带的 `_alphaMediaUrl` —— 最准确，且不会受
+             历史列表分页/排序影响；
+          2. 回查消息列表，优先按 rawid/platform_message_id/server_id 精确匹配；
+          3. 兼容 Alpha 的 `mediaUrl` 与 `media.resources[].url` 两套结构。
+
+        图片大小超过 config.IMAGE_MAX_BYTES 时跳过。下载仍放在网络线程中执行。
         """
-        talker = data.get("sessionId", "")
-        rawid = str(data.get("rawid", "") or "")
+        talker = data.get("sessionId", "") or data.get("conversation_id", "")
+        rawid = str(data.get("rawid", "") or "") or extract_message_id(data)
         source = create_message_source()
         try:
-            # Alpha 0.2.0 实测：media=true + limit>100 + order=desc 会触发
-            # 422 media.hydration_budget_exceeded（媒体注水预算）。50 安全。
-            payload = source.fetch_messages(
-                talker, limit=50, media=True,
-                # Alpha 默认升序（最旧在前）；要找「刚到的那张」必须倒序。
-                # WeFlow 忽略 order，保持原行为。
-                order="desc",
-            )
-            messages = payload if isinstance(payload, list) else payload.get("messages", payload.get("data", []))
-            if not isinstance(messages, list):
-                messages = []
+            media_url = str(data.get("_alphaMediaUrl") or "")
 
-            candidates = [m for m in messages if m.get("mediaUrl")]
-            if rawid:
-                exact = [m for m in candidates
-                         if (str(m.get("rawid", "")) == rawid
+            if not media_url:
+                # Alpha 0.2.0 实测：media=true + limit>100 + order=desc 会触发
+                # 422 media.hydration_budget_exceeded（媒体注水预算）。50 安全。
+                payload = source.fetch_messages(
+                    talker, limit=50, media=True,
+                    # Alpha 默认升序（最旧在前）；要找「刚到的那张」必须倒序。
+                    # WeFlow 忽略 order，保持原行为。
+                    order="desc",
+                )
+                messages = payload if isinstance(payload, list) else payload.get(
+                    "messages", payload.get("data", []))
+                if not isinstance(messages, list):
+                    messages = []
+
+                candidates = [m for m in messages if extract_media_url(m)]
+                if rawid:
+                    exact = [m for m in candidates
+                             if str(extract_message_id(m)) == rawid
+                             or str(m.get("rawid", "")) == rawid
                              or str(m.get("platform_message_id", "")) == rawid
-                             or str(m.get("server_id", "")) == rawid)]
-                if exact:
-                    candidates = exact
-            if not candidates:
-                log.warning(f"取图失败: 消息列表里没有可用图片 (talker={talker})")
+                             or str(m.get("server_id", "")) == rawid]
+                    if exact:
+                        candidates = exact
+                if not candidates:
+                    log.warning(f"取图失败: 消息列表里没有可用图片 (talker={talker})")
+                    return None
+                media_url = extract_media_url(candidates[0])
+
+            if not media_url:
+                log.warning(f"取图失败: 消息记录没有媒体 URL (talker={talker})")
                 return None
 
             # Alpha: /api/v1/media/...，需 Bearer；WeFlow: 绝对 URL + query token。
             # 统一交给 source.download_media 处理。
-            img = source.download_media(candidates[0]["mediaUrl"])
+            img = source.download_media(media_url)
             if img.status_code != 200:
-                log.warning(f"取图失败: 下载 HTTP {img.status_code}")
+                log.warning(f"取图失败: 下载 HTTP {img.status_code} (id={rawid or '-'})")
                 return None
             if not img.content:
-                log.warning("取图失败: 图片内容为空")
+                log.warning(f"取图失败: 图片内容为空 (id={rawid or '-'})")
                 return None
             if len(img.content) > config.IMAGE_MAX_BYTES:
                 log.warning(f"图片过大（{len(img.content) / 1048576:.1f}MB），已跳过")

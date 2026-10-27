@@ -518,13 +518,16 @@ async def _handle_ob_api(data: dict):
                     at_prefix = ""
                     if quote_target:
                         # 原生引用发出（内部失败会自动降级）
-                        await asyncio.to_thread(
+                        sent_ok = await asyncio.to_thread(
                             state.sender_instance.send_quote,
                             contact, quote_target, text)
                         quote_target = None
                     else:
-                        await asyncio.to_thread(
+                        sent_ok = await asyncio.to_thread(
                             state.sender_instance.send_text, contact, text)
+                    if not sent_ok:
+                        log.error(f"[OB11] 文字发送失败至 {contact}: {text[:50]}")
+                        continue
                     # 记录自己发出的内容：这条消息会被 WeFlow 读回来，
                     # 若不拦截会被当成用户输入再回一遍（自问自答）
                     state.note_sent_text(text)
@@ -582,10 +585,13 @@ async def _handle_ob_api(data: dict):
                         log.warning(f"[OB11] 图片发送失败 → 降级为发文件给 {contact}")
                         _rm = None
                         try:
-                            await asyncio.to_thread(
+                            file_ok = await asyncio.to_thread(
                                 state.sender_instance.send_file, contact, img_path)
-                            log.info(f"[OB11] 已作为文件发送至 {contact}")
-                            _rm = img_path
+                            if file_ok:
+                                log.info(f"[OB11] 已作为文件发送至 {contact}")
+                                _rm = img_path
+                            else:
+                                log.error(f"[OB11] 文件降级发送失败 → {contact}")
                         except Exception as e:
                             log.error(f"[OB11] 文件降级发送也失败 → {contact}: {e}")
                     # 只有真正送达（图或文件）才清理临时文件，失败保留供排查
@@ -629,9 +635,12 @@ async def _handle_ob_api(data: dict):
                         fpath = file_val
 
                     if fpath and os.path.isfile(fpath):
-                        await asyncio.to_thread(
+                        file_ok = await asyncio.to_thread(
                             state.sender_instance.send_file, contact, fpath)
-                        log.info(f"[OB11] 文件已发送至 {contact}: {os.path.basename(fpath)}")
+                        if file_ok:
+                            log.info(f"[OB11] 文件已发送至 {contact}: {os.path.basename(fpath)}")
+                        else:
+                            log.error(f"[OB11] 文件发送失败至 {contact}: {os.path.basename(fpath)}")
                     else:
                         log.warning(f"[OB11] 文件未找到，无法发送: {file_val[:120]}")
                 except Exception as e:
@@ -644,15 +653,21 @@ async def _handle_ob_api(data: dict):
                             pass
 
             elif seg_type == "face":
-                await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
-                log.info(f"[OB11] 表情已发送至 {contact}")
+                face_ok = await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
+                if face_ok:
+                    log.info(f"[OB11] 表情已发送至 {contact}")
+                else:
+                    log.error(f"[OB11] 表情发送失败至 {contact}")
 
             # 其他类型（record, video 等）忽略
 
         # 兜底：引用前缀没被任何文字段消费（如纯图片回复），单独发一条
         if quote_prefix:
-            await asyncio.to_thread(state.sender_instance.send_text, contact, quote_prefix.rstrip())
-            log.info(f"[OB11] 引用前缀已单独发送至 {contact}")
+            prefix_ok = await asyncio.to_thread(state.sender_instance.send_text, contact, quote_prefix.rstrip())
+            if prefix_ok:
+                log.info(f"[OB11] 引用前缀已单独发送至 {contact}")
+            else:
+                log.error(f"[OB11] 引用前缀发送失败至 {contact}")
 
     else:
         log.debug(f"[OB11] 未处理 API: {action}")

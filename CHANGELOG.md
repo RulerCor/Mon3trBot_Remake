@@ -1,5 +1,50 @@
 # 开发日志
 
+## v1.9.1 — Alpha 媒体链路与事件循环延迟修复（2026-10-27）
+
+### 修复
+
+- **Alpha 新旧字段差异归一**：兼容 `source_type` / `sent_at_unix_ms` /
+  `conversation_id` / `sender_id` / `text` 等字段，图片事件不再因只有
+  `media` 而没有正文被判成“空内容”。
+- **图片 URL 解析兼容两套结构**：优先使用 SSE / 历史事件自带的
+  `mediaUrl`，同时支持 `media.resources[].url`；回查历史时按消息 ID
+  精确匹配，避免同一会话连续来图时取错。
+- **顶层 `<msg><emoji ...>` 解析**：自定义表情可直接提取
+  `md5` / CDN 直链 / 大小并归一为 `sticker`，不再落入
+  `[无法解析的消息]`。
+- **发送结果判定补严**：文字、引用、图片降级文件、普通文件、表情和
+  引用前缀都按发送器真实返回值记录成功/失败，不再打印“已发送”造成假成功。
+- **事件循环热路径接管（`akasha_rc_patches` v1.3.2）**：
+  - Image 的 SDGen 插件发现增加 15s 缓存，避免每条回复触发
+    `gc.get_objects()` 全量扫描；
+  - REQ-041 快照复制移出事件循环，保留原有数据锁与快照语义；
+  - 延迟补丁在目标插件加载完成后接管；Image 不可用时允许 REQ-041
+    独立生效，避免永久停在待应用状态；
+  - Image 插件加载事件补上无效缓存清理，修复启动顺序导致的
+    `private_api=ready image_runtime=pending`。
+- **正式发行版构建器补漏**：`scripts/build_dist.py` 的桥接源码清单
+  加入 `message_source.py` 与 `wx_msg_parser.py`。此前 v1.9.0
+  发行包遗漏这两个模块，解压后桥接无法导入消息源和解析层。
+- **构建目录治理**：默认 stage 从盘根 `C:\_akasha_dist` 收到项目内
+  `build/`；复制前先做 Windows 260 字符路径预算检查；打包成功后自动
+  删除 stage，只留下 `release/dist/*.zip`，避免项目外残留。
+
+### 验证
+
+- 使用真实 Alpha 历史图片完成端到端取图：归一化为 `[图片]`，携带媒体
+  URL，下载得到 JPEG 字节并通过 magic number 校验。
+- 顶层 emoji XML 回归通过：解析为 `sticker`，`md5` / 大小 / URL
+  均可提取。
+- 纯图片消息入队回归通过：文本为空但 `pending_images=1`，不会因无正文
+  被丢弃。
+- `message_source.py`、`wx_msg_parser.py`、`bridge_core.py`、
+  `ob_protocol.py` 语法检查通过。
+- `scripts/akasha_rc_patches_plugin/main.py` 与运行时副本 `py_compile`
+  通过；PrivateCompanion 生命周期测试 10 项通过。
+- 重新构建发行版后核验 ZIP 条目，确认 `message_source.py` 与
+  `wx_msg_parser.py` 已包含在 `akasha/` 目录内。
+
 ## v1.9.0 — 按会话选择人类风格（2026-10-20）
 
 ### 新增

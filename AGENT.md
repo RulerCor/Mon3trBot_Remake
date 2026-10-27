@@ -305,8 +305,12 @@ Mon3trBot_Remake-vX.Y.Z/
 并同步收录进 `build_release.py` 的源码归档。
 **找不到只告警、不中止**——微信旧版安装包腾讯已下架，收件人可能得自行安装。
 
-**构建目录必须用短路径**（默认 `C:\_mon3trbot_dist`）：venv 近 5 万个小文件，
-放在深目录会撞 Windows 的 260 字符路径上限。
+**构建目录默认在项目内 `build/`**：全部项目相关文件都收在工作文件夹里，
+不再往盘根（`C:\_akasha_dist` 那种）散落。venv 近 5 万个小文件，
+深目录会撞 Windows 的 260 字符路径上限（本机未开长路径支持）：脚本在复制前会先算
+`check_path_budget()`，超限直接报错并提示换 `--stage`。
+**打包成功后 stage 会自动删除**（只留 `release/dist/*.zip`）；`--no-zip` 或
+`--keep-stage` 时保留，便于排查。
 
 **版本号约定**：发行版不单独编号，直接用它所打包的代码版本
 （`vX.Y.Z` 里的 X.Y.Z = `wechat-weflow-bridge-ob11/VERSION`）。

@@ -25,6 +25,79 @@ import state
 log = logging.getLogger("ob11-bridge")
 
 
+def extract_media_url(item: dict) -> str:
+    """从 Alpha 历史/SSE 消息中提取可下载媒体 URL。
+
+    Alpha 0.2.0 的 `/api/v1/messages` 在不同阶段会返回：
+      - 旧兼容字段：`mediaUrl`
+      - 新结构：`media.resources[].url`
+    只把已 resolve 的资源当作可用图片，避免把 unresolved 占位资源
+    交给下载层后误报“取图失败”。
+    """
+    if not isinstance(item, dict):
+        return ""
+    for key in ("mediaUrl", "media_url"):
+        value = str(item.get(key) or "")
+        if value:
+            return value
+
+    media = item.get("media")
+    if not isinstance(media, dict):
+        return ""
+    for res in media.get("resources") or []:
+        if not isinstance(res, dict):
+            continue
+        status = str(res.get("status") or "").lower()
+        if status and status != "resolved":
+            continue
+        value = str(res.get("url") or res.get("mediaUrl") or res.get("media_url") or "")
+        if value:
+            return value
+    return ""
+
+
+def extract_message_id(item: dict) -> str:
+    """统一取得消息 ID：兼容 SSE 与 /api/v1/messages 两套字段名。"""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("rawid", "platform_message_id", "server_id",
+                "source_id", "local_id", "id"):
+        value = item.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    return ""
+
+
+def infer_event_type(item: dict) -> int:
+    """从 Alpha 消息字段推断微信原生类型码，兼容 snake_case。"""
+    if not isinstance(item, dict):
+        return 0
+    for key in ("type", "msgType", "sourceType", "source_type"):
+        value = item.get(key)
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number:
+            return number
+
+    # 某些历史记录只给 kind=media + mimeType，没有 source_type。
+    media = item.get("media")
+    mime = ""
+    if isinstance(media, dict):
+        for res in media.get("resources") or []:
+            if isinstance(res, dict) and res.get("mimeType"):
+                mime = str(res.get("mimeType") or "").lower()
+                break
+    if mime.startswith("image/"):
+        return 3
+    if mime.startswith("video/"):
+        return 43
+    if mime.startswith("audio/"):
+        return 34
+    return 0
+
+
 class MessageSourceError(RuntimeError):
     """消息源不可用/配置错误。message 里不得包含 token。"""
 
@@ -307,38 +380,80 @@ class AlphaSource(BaseMessageSource):
         return s
 
     def normalize_event(self, data: dict) -> dict:
-        """Alpha SSE → bridge_core 兼容字段（不改变原始键，只做增量补充）。"""
+        """Alpha SSE / 历史记录 → bridge_core 兼容字段。
+
+        2026-10-21 实测：同一 Alpha 版本的两套接口字段名并不完全一致。
+        SSE 主要给 camelCase（`sessionId/sourceName/sourceType`），
+        `/api/v1/messages` 则会给 snake_case（`conversation_id/sender_id/source_type`）。
+        如果只认其中一套，图片会以“空内容”被跳过，地址/表情会变成 unknown。
+        """
         if not isinstance(data, dict):
             return data
         out = dict(data)
-        session_type = str(out.get("sessionType") or "")
-        session_id = str(out.get("sessionId") or "")
-        source_name = str(out.get("sourceName") or "")
-        is_group = session_type == "group" or "@chatroom" in session_id
+
+        session_id = str(out.get("sessionId") or out.get("session_id")
+                         or out.get("conversation_id") or out.get("conversationId") or "")
+        session_type = str(out.get("sessionType") or out.get("session_type") or "")
+        source_name = str(out.get("sourceName") or out.get("source_name")
+                          or out.get("sender_id") or out.get("senderId") or "")
+        sender_wxid = str(out.get("senderWxid") or out.get("sender_id")
+                          or out.get("senderId") or "")
+        sender_name = str(out.get("senderName") or out.get("sender_name") or "")
+
+        if session_id:
+            out["sessionId"] = session_id
+        is_group = (
+            session_type == "group"
+            or session_type == "2"
+            or "@chatroom" in session_id
+            or str(out.get("conversation_id") or "").endswith("@chatroom")
+        )
 
         # Alpha 群聊 sourceName 是发言成员 wxid；私聊是会话名。
         if is_group:
-            wxid = source_name
-            out["talkerId"] = wxid
-            out["senderWxid"] = wxid
-            # 群名册已拉到时给人类可读名；拉不到时先退 wxid，稳定 ID 仍由
-            # senderWxid 保证（bridge_core.process_sender 会优先用它）。
-            out["senderName"] = state.resolve_name_in_group(session_id, wxid) or wxid
+            wxid = sender_wxid or source_name
+            if wxid:
+                out["talkerId"] = wxid
+                out["senderWxid"] = wxid
+            resolved = (
+                state.resolve_name_in_group(session_id, wxid)
+                if session_id and wxid else ""
+            )
+            # sender_name 是历史接口已经给出的人类可读名；SSE 通常没有，
+            # 这时才查群名册。不要把两套字段互相覆盖。
+            out["senderName"] = sender_name or resolved or wxid or source_name
         else:
             out["talkerId"] = session_id
-            out["senderWxid"] = session_id
-            out["senderName"] = source_name or session_id
+            out["senderWxid"] = sender_wxid or session_id
+            out["senderName"] = sender_name or source_name or session_id
 
-        raw_content = str(out.get("content") or "")
-        # Alpha 0.2.0 实测：SSE 的图片事件可能是空 content，而不是 XML。
-        # 只有媒体类型码（3=图片 / 43=视频 / 34=语音）才映射占位符，
-        # 空 sourceType=1 的文本消息仍保持空内容，由旧逻辑按“空内容”跳过。
+        if not out.get("rawid"):
+            message_id = extract_message_id(out)
+            if message_id:
+                out["rawid"] = message_id
+
+        # 历史接口用秒/毫秒时间戳两套字段；统一给桥接的 start_timestamp 门禁。
+        if not out.get("timestamp"):
+            sent_ms = out.get("sent_at_unix_ms") or out.get("sentAtUnixMs")
+            if sent_ms:
+                try:
+                    out["timestamp"] = int(int(sent_ms) / 1000)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                sent = out.get("sort_timestamp") or out.get("last_activity_unix_ms")
+                if sent:
+                    try:
+                        value = int(sent)
+                        out["timestamp"] = value // 1000 if value > 10_000_000_000 else value
+                    except (TypeError, ValueError):
+                        pass
+
+        # Alpha 有的接口把正文放 content，有的放 text；两处都兼容。
+        raw_content = str(out.get("content") or out.get("text") or "")
         if not raw_content.strip():
-            try:
-                event_type = int(out.get("type") or out.get("msgType")
-                                 or out.get("sourceType") or 0)
-            except (TypeError, ValueError):
-                event_type = 0
+            # Alpha 0.2.0 实测：图片/视频/语音媒体事件可能是空内容。
+            event_type = infer_event_type(out)
             if event_type == 3:
                 out["content"] = "[图片]"
             elif event_type == 43:
@@ -349,6 +464,12 @@ class AlphaSource(BaseMessageSource):
                 out["content"] = raw_content
         else:
             out["content"] = self._classify_content(raw_content)
+
+        # 让取图层优先直接使用 SSE/历史记录已带上的媒体地址，
+        # 避免再次查询历史列表时因分页/排序变化而取到别的图片。
+        media_url = extract_media_url(out)
+        if media_url:
+            out["_alphaMediaUrl"] = media_url
         out["_alphaRawContent"] = raw_content
         return out
 

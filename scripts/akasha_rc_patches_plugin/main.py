@@ -16,6 +16,7 @@ Runtime patches:
   8. group_alias_note       explain nickname/remark aliases in group context
   9. active_reply_blacklist keep the 4.29-removed group blacklist behavior
  10. humanizer_session_style apply per-session humanizer style overrides
+ 11. event_loop_hotpaths cache blocking plugin discovery/snapshot helpers
 
 The active-reply blacklist and humanizer style overrides are stored under
 AstrBot's plugin_data directory.
@@ -24,11 +25,13 @@ scripts/check_patches.py; they are not modified by this plugin.
 """
 
 from contextvars import ContextVar
+import asyncio
 import hashlib
 import inspect
 import io
 import json
 import os
+import time
 
 from astrbot.api import logger
 from astrbot.api.event import filter as event_filter, AstrMessageEvent
@@ -46,6 +49,12 @@ HUMANIZER_STYLE_OVERRIDES_PATH = os.path.normpath(os.path.join(
 ))
 HUMANIZER_PLUGIN_NAME = "astrbot_plugin_wanna_be_human"
 HUMANIZER_PATCH_KEY = "humanizer_session_style"
+HOTPATH_PLUGIN_NAMES = (
+    "astrbot_plugin_private_companion",
+    "astrbot_plugin_image_companion",
+)
+HOTPATH_PATCH_KEY = "event_loop_hotpaths"
+_HOTPATH_PENDING_PATCHES = {HOTPATH_PATCH_KEY}
 _HUMANIZER_ACTIVE_STYLE = ContextVar("mon3tr_humanizer_active_style", default="")
 
 
@@ -581,6 +590,183 @@ def _patch_group_alias_note():
             "_format_group_history_block", "同名说明运行时接管")
 
 
+
+def _find_private_companion_api():
+    """Return the live private companion extension API without a dashboard query."""
+    try:
+        from astrbot.core.star.star import star_map
+    except Exception:
+        star_map = {}
+    api = None
+    for metadata in star_map.values():
+        if getattr(metadata, "name", "") != "astrbot_plugin_private_companion":
+            continue
+        plugin = getattr(metadata, "star_cls", None)
+        api = getattr(plugin, "extension_api", None) if plugin is not None else None
+        if api is not None:
+            break
+    if api is None:
+        try:
+            import astrbot_plugin_private_companion.main as companion_main
+            api = companion_main.get_private_companion_api()
+        except Exception:
+            api = None
+    if api is None:
+        try:
+            import data.plugins.astrbot_plugin_private_companion.main as companion_main
+            api = companion_main.get_private_companion_api()
+        except Exception:
+            api = None
+    if api is not None:
+        lifecycle = getattr(api, "bridge_lifecycle_status", None)
+        if callable(lifecycle):
+            try:
+                status = lifecycle()
+            except Exception:
+                return None
+            if not isinstance(status, dict) or status.get("active") is not True:
+                return None
+    return api
+
+
+def _patch_event_loop_hotpaths():
+    """Apply event-loop latency fixes after their target plugins have loaded."""
+    results = []
+    for patch in (_patch_image_sdgen_lookup_cache, _patch_req041_scoped_snapshot_async):
+        try:
+            result = patch()
+        except Exception:
+            result = None
+        if result:
+            results.append(result)
+    if not results:
+        return None
+    return ("runtime-hotpaths", "+".join(item[1] for item in results),
+            "; ".join(item[2] for item in results), len(results))
+
+
+def _find_image_runtime():
+    """Resolve the image API from AstrBot's registry, with Private fallback."""
+    try:
+        from astrbot.core.star.star import star_map
+        for metadata in star_map.values():
+            if getattr(metadata, "name", "") != "astrbot_plugin_image_companion":
+                continue
+            instance = getattr(metadata, "star_cls", None)
+            api = getattr(instance, "extension_api", None) if instance is not None else None
+            if api is not None:
+                return api
+            module = getattr(metadata, "module", None)
+            getter = getattr(module, "get_image_companion_api", None)
+            if callable(getter):
+                try:
+                    return getter()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    api = _find_private_companion_api()
+    image_api = getattr(api, "_image_companion_api", None)
+    return image_api() if callable(image_api) else None
+
+
+def _patch_image_sdgen_lookup_cache():
+    """Cache the Image runtime's registry-backed SDGen discovery.
+
+    ``ImageGenerationRuntime.capability_status()`` is queried while formatting
+    the passive environment prompt.  Its ``_find_sdgen_plugin()`` fallback
+    performed a full ``gc.get_objects()`` scan on every request; the watchdog
+    repeatedly captured a 30s event-loop stop there.  A bounded cache keeps the
+    same discovery semantics while preventing per-message GC scans.  Hot reload
+    is handled by the resolver's short positive TTL and by plugin lifecycle
+    invalidation.
+    """
+    image = _find_image_runtime()
+    if image is None:
+        return None
+    runtime_cls = type(image)
+    original = getattr(runtime_cls, "_find_sdgen_plugin", None)
+    if (
+        not callable(original)
+        or getattr(original, "__self__", None) is not None
+        or getattr(original, "_akasha_cached", False)
+    ):
+        return None
+    cache = {"ts": 0.0, "value": None}
+    ttl = 15.0
+
+    def _find_sdgen_plugin(self):
+        now = time.monotonic()
+        if now - cache["ts"] <= ttl:
+            return cache["value"]
+        value = original(self)
+        if value is None:
+            # A short negative window catches a newly loaded plugin without
+            # putting the GC scan back on the per-message hot path.
+            cache.update(ts=now, value=None)
+            return None
+        cache.update(ts=now, value=value)
+        return value
+
+    _find_sdgen_plugin._akasha_cached = True
+    _find_sdgen_plugin.__name__ = "_find_sdgen_plugin"
+    runtime_cls._find_sdgen_plugin = _find_sdgen_plugin
+    return ("astrbot_plugin_image_companion.image_runtime.ImageGenerationRuntime",
+            "_find_sdgen_plugin", "SDGen 插件发现缓存（GC 热路径修复）")
+
+
+def _patch_req041_scoped_snapshot_async():
+    """Move the legacy snapshot copy required by REQ-041 off the event loop.
+
+    ``_req041_sync_scoped_now`` kept ``deepcopy(default_data)`` and all persona
+    profiles inside the plugin data lock.  In this deployment that call occurs on
+    every scheduled persistence save.  The watchdog repeatedly showed the event
+    loop stopped inside this copy, delaying unrelated chat replies.  We preserve
+    the same data lock and the same snapshot helper, but execute it in a worker
+    thread so the loop stays responsive while the copy is running.
+    """
+    api = _find_private_companion_api()
+    if api is None:
+        return None
+    original = getattr(api, "_req041_sync_scoped_now", None)
+    snapshot_fn = getattr(api, "_req041_legacy_snapshots_locked", None)
+    if (
+        not callable(original)
+        or not callable(snapshot_fn)
+        or getattr(original, "_akasha_async_snapshot", False)
+    ):
+        return None
+
+    async def _req041_sync_scoped_now():
+        synchronizer = getattr(api, "req041_scoped_projection_sync", None)
+        if synchronizer is None:
+            return {"ok": False, "code": "scoped_projection_not_initialized", "scopes": []}
+        synchronizer.mark_dirty()
+        async with api._data_lock:
+            snapshots = await asyncio.to_thread(snapshot_fn)
+        results = []
+        for source_scope, snapshot in snapshots:
+            results.append(await asyncio.to_thread(
+                synchronizer.sync_snapshot, snapshot, source_scope=source_scope
+            ))
+        ok = all(item.get("ok") is True for item in results)
+        summary = {
+            "ok": ok,
+            "code": "scoped_projection_synced" if ok else "scoped_projection_degraded",
+            "scopes": results,
+            "records": sum(int(item.get("records") or 0) for item in results),
+            "errors": sum(int(item.get("errors") or 0) for item in results),
+        }
+        api.req041_scoped_projection_status = summary
+        return summary
+
+    _req041_sync_scoped_now._akasha_async_snapshot = True
+    _req041_sync_scoped_now.__name__ = "_req041_sync_scoped_now"
+    api._req041_sync_scoped_now = _req041_sync_scoped_now
+    return ("astrbot_plugin_private_companion.extension_api",
+            "_req041_sync_scoped_now", "REQ-041 快照复制移出事件循环")
+
+
 PATCHES = [
     ("active_reply_blacklist", "主动回复黑名单运行时接管（4.29 回归修复）", _patch_active_reply_blacklist),
     ("provider_getkeys", "provider get_keys 归一化（修复 All chat models failed）", _patch_provider_getkeys),
@@ -592,6 +778,7 @@ PATCHES = [
     ("cron_sender_name", "Cron 合成发送者名中性化（防 Scheduler博士泄漏）", _patch_cron_sender_name),
     ("group_alias_note", "群聊同名说明（昵称=备注）", _patch_group_alias_note),
     ("humanizer_session_style", "人类风格注入按会话选择检索风格", _patch_humanizer_session_style),
+    ("event_loop_hotpaths", "事件循环热路径：SDGen 发现缓存与 REQ-041 快照异步化", _patch_event_loop_hotpaths),
 ]
 
 
@@ -607,17 +794,18 @@ class AkashaPatchesPlugin(Star):
 
     async def initialize(self):
         logger.info("=" * 56)
-        logger.info("[Mon3trBot补丁] 开始应用核心补丁集 v1.2.0")
+        logger.info("[Mon3trBot补丁] 开始应用核心补丁集 v1.3.2")
         logger.info("=" * 56)
         for key, desc, fn in PATCHES:
-            if key == HUMANIZER_PATCH_KEY:
+            if key in {HUMANIZER_PATCH_KEY, HOTPATH_PATCH_KEY}:
                 try:
                     result = fn()
                     if result:
                         self.applied[key] = result
                         logger.info(f"  ✅ {desc} → {result[2]}")
                     else:
-                        logger.info(f"  ⏳ {desc} → 等待人类风格插件加载")
+                        waiting = "目标插件加载" if key == HUMANIZER_PATCH_KEY else "目标插件加载/接口就绪"
+                        logger.info(f"  ⏳ {desc} → 等待{waiting}")
                 except Exception as e:
                     logger.error(f"  ❌ {desc} → {type(e).__name__}: {e}")
                 continue
@@ -633,19 +821,92 @@ class AkashaPatchesPlugin(Star):
         logger.info(f"[Mon3trBot补丁] 完成：{len(self.applied)}/{len(PATCHES)} 项生效")
         logger.info("=" * 56)
 
+    def _apply_hotpath_patch(self):
+        """Apply the hot-path patch once every cooperating plugin is loaded."""
+        result = _patch_event_loop_hotpaths()
+        if not result:
+            # Diagnose the exact late-binding blocker so this cannot silently
+            # regress to the previous "waiting forever" state.
+            api = _find_private_companion_api()
+            image_api = getattr(api, "_image_companion_api_fresh", None)
+            try:
+                image = image_api() if callable(image_api) else None
+            except Exception as exc:
+                image = None
+                logger.warning(f"[Mon3trBot补丁][事件循环热路径] Image API 解析失败: {type(exc).__name__}: {exc}")
+            logger.info(
+                "[Mon3trBot补丁][事件循环热路径] 目标接口状态: "
+                f"private_api={'ready' if api is not None else 'pending'} "
+                f"image_runtime={'ready' if image is not None else 'pending'}"
+            )
+            return None
+        self.applied[HOTPATH_PATCH_KEY] = result
+        if int(result[3]) >= 2:
+            _HOTPATH_PENDING_PATCHES.discard(HOTPATH_PATCH_KEY)
+        logger.info(f"  ✅ 事件循环热路径：SDGen 发现缓存与 REQ-041 快照异步化 → {result[2]}")
+        return result
+
     @event_filter.on_plugin_loaded()
     async def _on_plugin_loaded(self, metadata):
-        """Apply the humanizer patch after its plugin has been fully loaded."""
-        if getattr(metadata, "name", "") != HUMANIZER_PLUGIN_NAME:
-            return
-        try:
-            result = _patch_humanizer_session_style()
-        except Exception as e:
-            logger.error(f"[Mon3trBot补丁][会话风格] 延迟接管失败：{type(e).__name__}: {e}")
-            return
-        if result:
-            self.applied[HUMANIZER_PATCH_KEY] = result
-            logger.info(f"  ✅ 人类风格注入按会话选择检索风格 → {result[2]}")
+        """Apply late patches after their target plugins have fully loaded."""
+        # PrivateCompanion invalidates its optional bridge caches here. Keep
+        # that behavior independent of the handler-repair code below: the
+        # image plugin may load before the private companion publishes its API.
+        if str(getattr(metadata, "name", "") or "") == "astrbot_plugin_image_companion":
+            try:
+                api = _find_private_companion_api()
+                invalidate = getattr(api, "_image_companion_api_fresh", None)
+                if callable(invalidate):
+                    invalidate()
+            except Exception:
+                pass
+        name = str(getattr(metadata, "name", "") or "")
+        if name == HUMANIZER_PLUGIN_NAME:
+            try:
+                result = _patch_humanizer_session_style()
+            except Exception as e:
+                logger.error(f"[Mon3trBot补丁][会话风格] 延迟接管失败：{type(e).__name__}: {e}")
+                return
+            if result:
+                self.applied[HUMANIZER_PATCH_KEY] = result
+                logger.info(f"  ✅ 人类风格注入按会话选择检索风格 → {result[2]}")
+        if HOTPATH_PATCH_KEY in _HOTPATH_PENDING_PATCHES:
+            try:
+                self._apply_hotpath_patch()
+                # The extension API publishes only after initialize(), which
+                # AstrBot runs before emitting this hook. The image bridge may
+                # additionally cache a negative result while the image plugin
+                # is still finishing startup. Use the fresh resolver once and
+                # give activation a bounded chance instead of leaving this patch
+                # permanently pending.
+                # One delayed task is sufficient. Repeated hook invocations
+                # each retry for a bounded window; after that the status command
+                # and the next plugin reload can retry without spamming logs.
+                if not getattr(self, "_hotpath_retry_task", None):
+                    async def _retry_hotpath():
+                        for _ in range(180):
+                            if HOTPATH_PATCH_KEY not in _HOTPATH_PENDING_PATCHES:
+                                return
+                            await asyncio.sleep(1.0)
+                            self._apply_hotpath_patch()
+                        # ImageCompanion may legitimately be unavailable when
+                        # PrivateCompanion is absent. REQ-041 does not depend
+                        # on it, so apply the completed hotpath patch instead
+                        # of reporting a partial patch forever.
+                        req041 = _patch_req041_scoped_snapshot_async()
+                        if req041:
+                            self.applied[HOTPATH_PATCH_KEY] = (
+                                "runtime-hotpaths", req041[1], req041[2], 1,
+                            )
+                            _HOTPATH_PENDING_PATCHES.discard(HOTPATH_PATCH_KEY)
+                            logger.info(
+                                "  ✅ 事件循环热路径：REQ-041 快照异步化已生效；Image/SDGen 未安装或暂不可用"
+                            )
+                    self._hotpath_retry_task = asyncio.create_task(
+                        _retry_hotpath(), name="akasha-hotpath-retry"
+                    )
+            except Exception as e:
+                logger.error(f"[Mon3trBot补丁][事件循环热路径] 延迟接管失败：{type(e).__name__}: {e}")
 
     @event_filter.command("akasha_patches")
     async def status_cmd(self, event: AstrMessageEvent):
@@ -653,7 +914,7 @@ class AkashaPatchesPlugin(Star):
         lines = ["Mon3trBot_Remake 核心补丁集状态："]
         for key, desc, _ in PATCHES:
             mark = "✅" if key in self.applied else (
-                "⏳" if key == HUMANIZER_PATCH_KEY else "⏭️"
+                "⏳" if key in {HUMANIZER_PATCH_KEY, HOTPATH_PATCH_KEY} else "⏭️"
             )
             lines.append(f"{mark} {desc}")
         lines.append(f"共 {len(self.applied)}/{len(PATCHES)} 项由本插件接管；"

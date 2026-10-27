@@ -1,4 +1,4 @@
-"""微信消息统一解析层（方案 B）。
+﻿"""微信消息统一解析层（方案 B）。
 
 ## 为什么需要它
 
@@ -182,6 +182,24 @@ def _unescape(s: str) -> str:
 def _tag(xml: str, name: str) -> str:
     """取第一个 <name>...</name> 的内容（非贪婪）。"""
     m = re.search(rf"<{name}>(.*?)</{name}>", xml, re.S)
+    return _unescape(m.group(1)) if m else ""
+
+
+def _attr(xml: str, tag: str, name: str) -> str:
+    """取标签属性，兼容 `name="x"` 与 `name = "x"` 两种微信写法。"""
+    quoted = r"""["']([^"']*)["']"""
+    # 优先精确限定属性名，避免 androidmd5 反向匹配 md5。
+    pattern = rf"<{tag}\b[^>]*?\b{re.escape(name)}\s*=\s*{quoted}"
+    m = re.search(pattern, xml, re.I | re.S)
+    if m:
+        return _unescape(m.group(1))
+
+    # 兜底：微信 XML 属性间可能有换行；先截取标签再匹配。
+    tag_match = re.search(rf"<{tag}\b([^>]*)>", xml, re.I | re.S)
+    if not tag_match:
+        return ""
+    attrs = tag_match.group(1)
+    m = re.search(rf"\b{re.escape(name)}\s*=\s*{quoted}", attrs, re.I | re.S)
     return _unescape(m.group(1)) if m else ""
 
 
@@ -400,6 +418,35 @@ def _parse_system(xml: str, bot_nicknames: tuple = ()) -> ParsedMessage:
     return p
 
 
+def _parse_top_level_emoji(xml: str) -> ParsedMessage:
+    """解析顶层 `<msg><emoji ...>` 自定义表情。
+
+    2026-10-21 Alpha 历史/推送实测：自定义表情不总走 appmsg type=8，
+    也会直接给 `<msg><emoji ... md5=... cdnurl=...></emoji></msg>`。
+    旧入口虽把 emoji 列为 XML 标签，却没有对应分支，最终落到
+    `[无法解析的消息]`。这里同时兼容：
+      · md5/androidmd5
+      · cdnurl/encrypturl/externurl
+      · len/androidlen
+    """
+    md5 = (_attr(xml, "emoji", "md5")
+           or _attr(xml, "emoji", "androidmd5")
+           or _attr(xml, "emoji", "s60v3md5"))
+    url = (_attr(xml, "emoji", "cdnurl")
+           or _attr(xml, "emoji", "externurl")
+           or _attr(xml, "emoji", "encrypturl"))
+    try:
+        size = int(_attr(xml, "emoji", "len")
+                   or _attr(xml, "emoji", "androidlen")
+                   or _attr(xml, "emoji", "s60v3len") or 0)
+    except ValueError:
+        size = 0
+
+    p = ParsedMessage(kind=KIND_STICKER, raw=xml, text="[表情]",
+                      sticker_md5=md5, sticker_url=url, sticker_size=size)
+    return p
+
+
 def parse_content(content: str, bot_nicknames: tuple = ()) -> ParsedMessage:
     """把微信原始 content 解析成结构化消息。
 
@@ -458,6 +505,11 @@ def parse_content(content: str, bot_nicknames: tuple = ()) -> ParsedMessage:
                 st = m.group(1) if m else "unknown"
                 return ParsedMessage(kind=KIND_SYSTEM, raw=s,
                                      text=f"[系统消息:{st}]", system_kind=st)
+
+            # 顶层自定义表情：必须在 appmsg 判定之前处理。
+            # 形态是 <msg><emoji ...></emoji></msg>，没有 <appmsg>。
+            if "<emoji" in s and "<appmsg" not in s:
+                return _parse_top_level_emoji(s)
 
             atype = _appmsg_type(s)
 

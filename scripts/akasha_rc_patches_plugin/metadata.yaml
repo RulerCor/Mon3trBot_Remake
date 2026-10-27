@@ -1,5 +1,5 @@
 name: akasha_rc_patches
 desc: Mon3trBot_Remake 运行时补丁集，避免 AstrBot 升级覆盖本项目行为。含会话风格与 /akasha_patches 状态命令。
-version: v1.2.0
+version: v1.3.2
 author: RulerCor
 repo: https://github.com/RulerCor/Mon3trBot_Remake

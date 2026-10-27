@@ -41,6 +41,9 @@ vendor/
 # ===== 发布产物（用 scripts/build_release.py / build_dist.py 生成，不入库）=====
 release/
 
+# ===== 出包构建目录（build_dist.py 默认 stage；打包后自动删除）=====
+build/
+
 # ===== 安装包源码目录（WeFlow / 微信 的 exe，体积大且非本仓库代码，不入库）=====
 # 构建时由 build_dist.py 收录进发行版；放这里是为了让出包流程有个固定入口。
 installers_src/
