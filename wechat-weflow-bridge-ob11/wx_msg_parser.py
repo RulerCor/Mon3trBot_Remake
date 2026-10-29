@@ -185,6 +185,19 @@ def _tag(xml: str, name: str) -> str:
     return _unescape(m.group(1)) if m else ""
 
 
+def _raw_tag(xml: str, name: str) -> str:
+    """取第一个 <name>...</name> 的**原始**内容（不做实体解码）。
+
+    与 `_tag` 的区别：`_tag` 会把 `&lt;` 解成 `<`。引用消息的
+    `<refermsg><content>` 里嵌套了一整段被转义的微信 XML，解码后
+    其中的 `<img>` 等标签会"浮"到外层，再去做 `_tag` 查找就可能
+    误命中嵌套标签。需要在外层结构里找字段（如 `svrid`）时必须用
+    原始文本。
+    """
+    m = re.search(rf"<{name}>(.*?)</{name}>", xml, re.S)
+    return m.group(1) if m else ""
+
+
 def _attr(xml: str, tag: str, name: str) -> str:
     """取标签属性，兼容 `name="x"` 与 `name = "x"` 两种微信写法。"""
     quoted = r"""["']([^"']*)["']"""
@@ -302,6 +315,49 @@ def _parse_file(xml: str) -> ParsedMessage:
     return p
 
 
+def _extract_quote_image_meta(quote_text: str, refer_raw: str = "") -> dict:
+    """从被引用消息的内嵌 XML 里取出图片元数据。
+
+    背景（2026-10-29 实测）：微信引用一张图片时，`<refermsg><content>`
+    里是「发送者 wxid: + 一坨被 `&lt;` 转义的图片 XML」，形如::
+
+        wxid_xxx:
+        <?xml version="1.0"?>
+        <msg><img aeskey="..." cdnbigimgurl="305f02..." length="87998"
+                  md5="3398762cea..." ...></msg>
+
+    旧的 `_parse_quote` 只判断 `re.search(r"<img\b")` 就写死
+    `[图片]`，md5 / length / svrid 全部丢掉 —— 结果桥接无法回查下载，
+    AstrBot 收到的只有文本段，「识图」永远不触发（bot 只能答
+    "看不清"）。
+
+    这里只负责**取元数据**：`text` 结构保持不变（仍是 `[图片]`），
+    下载由 bridge_core 完成。取不到就返回 {} —— 解析层永不因此抛错。
+    """
+    if not quote_text or not re.search(r"<img\b", quote_text, re.I):
+        return {}
+    try:
+        try:
+            size = int(_attr(quote_text, "img", "length") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        url_kind = ""
+        for kind in ("cdnbigimgurl", "cdnmidimgurl", "cdnthumburl"):
+            if _attr(quote_text, "img", kind):
+                url_kind = kind
+                break
+        return {
+            # 原消息 server_id：Alpha 历史接口用它精确回查那条图片消息
+            "svrid": _tag(refer_raw, "svrid") if refer_raw else "",
+            "md5": _attr(quote_text, "img", "md5"),
+            "aeskey": _attr(quote_text, "img", "aeskey"),
+            "size": size,
+            "url_kind": url_kind,
+        }
+    except Exception:
+        return {}
+
+
 def _parse_quote(xml: str) -> ParsedMessage:
     """解析引用回复（appmsg type=57）。
 
@@ -313,8 +369,16 @@ def _parse_quote(xml: str) -> ParsedMessage:
     title = _tag(xml, "title")
     quote_text = _tag(xml, "content")
     quote_sender = _tag(xml, "displayname")
+    # refer_raw 必须在 quote_text 之外单独取：content 解码后内部标签会浮上来。
+    refer_raw = _raw_tag(xml, "refermsg")
     p = ParsedMessage(kind=KIND_QUOTE, raw=xml, text=title,
                       quote_text=quote_text, quote_sender=quote_sender)
+
+    # 被引用的是图片 → 记下 svrid/md5，供上层回查并下载成 image 段。
+    # 注意：这里**只是记录**，text 仍然是 `[图片]`，行为不降级。
+    quote_image = _extract_quote_image_meta(quote_text, refer_raw)
+    if quote_image:
+        p.extra["quote_image"] = quote_image
 
     if quote_text:
         if re.search(r"<(msg|appmsg|img)\b", quote_text, re.I):

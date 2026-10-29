@@ -62,3 +62,7 @@ logs/
 # ===== Alpha 运行时数据（delivery tickets / runs 库，Alpha 启动时按 CWD 生成）=====
 # 含 delivery-tickets.key —— 等同凭据，绝不入库。
 .alpha/
+
+# ===== 本地排查/分析脚本与采样（AI 排查用，不入库）=====
+tools/
+tmp_*.py

@@ -177,6 +177,9 @@ class WeFlowBridge:
             entry = {
                 "messages": [],
                 "pending_images": [],   # 待下载的图片原始数据（推送前统一处理）
+                # 引用图片的元数据（svrid/md5）：下载同样放到推送前做，
+                # 避免在 SSE 接收线程里同步翻页造成消息积压（实测每页 ~4s）。
+                "pending_quote_images": [],
                 "timer": None,
                 "timer_version": 0,
                 "processing": False,
@@ -540,6 +543,19 @@ class WeFlowBridge:
             # 下载放锁外（网络耗时），失败不影响文字部分照常推送。
             sticker_image = self._fetch_sticker_segment(parsed)
 
+        # 被引用的图片：这里只**记录元数据**，推送时再回查/下载。
+        # 为什么需要（2026-10-29）：微信引用图片时，正文只有一句
+        # 「〔引用 某某：[图片]〕」，AstrBot 收不到 image 段就不会触发识图，
+        # 模型只能答"看不清"。靠 refermsg 的 svrid 回查 Alpha 历史拿到原图，
+        # 再作为标准 OneBot image 段和文字一起推送。
+        #
+        # ⚠️ 刻意不在本函数（SSE 接收线程）里下载：回查历史实测每页 ~4s，
+        # 翻 2 页 + 下载接近 10s，会把**所有会话**的消息接收一起卡住。
+        # 改到 process_sender 的 Timer 线程里做，与普通图片下载同一条路径；
+        # 失败只记日志，文字照常推送（能力只增不减）。
+        quote_image = ((parsed.extra or {}).get("quote_image")
+                       if parsed.kind == wx_msg_parser.KIND_QUOTE else None)
+
         with self.buffer_lock:
             entry = self._ensure_entry(buffer_key, data, contact, is_group,
                                        base_name, sender_in_group, session_id_data)
@@ -548,6 +564,9 @@ class WeFlowBridge:
                 entry["mentioned_any"] = True
             if sticker_image:
                 entry.setdefault("pending_sticker_segments", []).append(sticker_image)
+            if quote_image:
+                entry["pending_quote_images"].append(
+                    self._start_quote_image_fetch(session_id_data, quote_image, contact))
             self._schedule_flush(buffer_key, entry)
 
         log.info(f"📩 收到 {parsed.kind}（{parsed.text[:40]}）"
@@ -579,6 +598,65 @@ class WeFlowBridge:
         except Exception as e:
             log.warning(f"表情下载异常: {e}")
             return None
+
+    def _start_quote_image_fetch(self, session_id_data, quote_image, contact):
+        """在后台线程里回查/下载引用图片，返回一个结果持有器。
+
+        为什么要并发：回查历史实测每页 ~4s，翻 2 页 + 下载接近 10s。
+        接收时立刻开跑，正好与 5s 缓冲窗口重叠 —— 推送时通常已经拿到，
+        SSE 接收线程也完全不会被网络 I/O 拖住。
+
+        持有器结构：{"meta", "event", "segment"}。取不到就是 segment=None，
+        调用方据此退回纯文本（能力只增不减）。
+        """
+        holder = {"meta": quote_image, "event": threading.Event(), "segment": None}
+
+        def worker():
+            try:
+                holder["segment"] = self._fetch_quote_image_segment(
+                    session_id_data, quote_image, contact)
+            except Exception as e:
+                log.warning(f"引用图片后台下载异常: {e}")
+            finally:
+                holder["event"].set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return holder
+
+    def _await_quote_image_segment(self, holder):
+        """等待后台回查结果；超时/失败返回 None（文字照常推送）。"""
+        if not isinstance(holder, dict):
+            return None
+        event = holder.get("event")
+        if event is not None:
+            event.wait(timeout=config.QUOTE_IMAGE_FETCH_TIMEOUT)
+        return holder.get("segment")
+
+    def _fetch_quote_image_segment(self, session_id_data, quote_image, contact):
+        """下载被引用的图片，返回 OneBot image 段；失败返回 None。
+
+        只用 svrid 精确回查：md5/aeskey 是微信 CDN 那套加密元数据，
+        不经解密拿不到图；而 Alpha 历史里同一条图片消息带的是已 resolve
+        的 media URL，直接下就能拿到原字节（实测 87998 字节，与 XML
+        `length` 完全一致）。
+        """
+        svrid = str((quote_image or {}).get("svrid") or "").strip()
+        if not svrid:
+            log.info("引用图片没有 svrid，无法回查（保留 [图片] 文本）")
+            return None
+        try:
+            b64 = self._fetch_image_base64(
+                {"sessionId": session_id_data, "rawid": svrid},
+                max_pages=config.QUOTE_IMAGE_SEARCH_PAGES)
+        except TypeError:
+            # 兼容旧签名（防御性，正常不会走到）
+            b64 = self._fetch_image_base64({"sessionId": session_id_data, "rawid": svrid})
+        if not b64:
+            log.warning(f"引用图片回查失败（svrid={svrid}，保留 [图片] 文本）[{contact}]")
+            return None
+        log.info(f"🖼️ 引用图片已下载（{len(b64) * 3 // 4 // 1024}KB，"
+                 f"svrid={svrid}）[{contact}]")
+        return {"type": "image", "data": {"file": f"base64://{b64}"}}
 
     def _enqueue_image(self, data, is_group, session_id_data, sender_in_group,
                        group_name_raw, source_name):
@@ -615,11 +693,14 @@ class WeFlowBridge:
             msgs = entry["messages"].copy()
             pending_images = entry.get("pending_images", [])
             pending_stickers = entry.get("pending_sticker_segments", [])
-            if not msgs and not pending_images and not pending_stickers:
+            pending_quote_images = entry.get("pending_quote_images", [])
+            if (not msgs and not pending_images and not pending_stickers
+                    and not pending_quote_images):
                 return
             entry["messages"] = []
             entry["pending_images"] = []
             entry["pending_sticker_segments"] = []
+            entry["pending_quote_images"] = []
             entry["processing"] = True
             if entry["timer"]:
                 entry["timer"].cancel()
@@ -646,6 +727,13 @@ class WeFlowBridge:
         if pending_stickers:
             image_segments.extend(pending_stickers)
             log.info(f"😀 表情 {len(pending_stickers)} 个就绪 [{contact}]")
+
+        # 引用图片：回查在接收时已并发启动（见 _start_quote_image_fetch），
+        # 这里只等结果，网络耗时已与 5s 缓冲窗口重叠。
+        for holder in pending_quote_images:
+            seg = self._await_quote_image_segment(holder)
+            if seg:
+                image_segments.append(seg)
 
         log.info(f"推送 {len(msgs)} 条消息"
                  + (f" + {len(image_segments)} 张图片" if image_segments else "")
@@ -782,7 +870,9 @@ class WeFlowBridge:
             if entry is not None:
                 entry["processing"] = False
                 # 推送期间可能又来了消息 —— 必须重新安排，否则会一直压在缓冲里
-                if entry["messages"] or entry["pending_images"]:
+                if (entry["messages"] or entry["pending_images"]
+                        or entry.get("pending_quote_images")
+                        or entry.get("pending_sticker_segments")):
                     self._schedule_flush(sender_id, entry)
 
     def listen_sse(self):
@@ -872,7 +962,7 @@ class WeFlowBridge:
         finally:
             self._sse_session = None
 
-    def _fetch_image_base64(self, data) -> str | None:
+    def _fetch_image_base64(self, data, max_pages: int = 1) -> str | None:
         """取得图片字节并返回 base64。
 
         顺序：
@@ -892,30 +982,45 @@ class WeFlowBridge:
             if not media_url:
                 # Alpha 0.2.0 实测：media=true + limit>100 + order=desc 会触发
                 # 422 media.hydration_budget_exceeded（媒体注水预算）。50 安全。
-                payload = source.fetch_messages(
-                    talker, limit=50, media=True,
-                    # Alpha 默认升序（最旧在前）；要找「刚到的那张」必须倒序。
-                    # WeFlow 忽略 order，保持原行为。
-                    order="desc",
-                )
-                messages = payload if isinstance(payload, list) else payload.get(
-                    "messages", payload.get("data", []))
-                if not isinstance(messages, list):
-                    messages = []
-
-                candidates = [m for m in messages if extract_media_url(m)]
-                if rawid:
-                    exact = [m for m in candidates
-                             if str(extract_message_id(m)) == rawid
-                             or str(m.get("rawid", "")) == rawid
-                             or str(m.get("platform_message_id", "")) == rawid
-                             or str(m.get("server_id", "")) == rawid]
-                    if exact:
-                        candidates = exact
-                if not candidates:
-                    log.warning(f"取图失败: 消息列表里没有可用图片 (talker={talker})")
+                # 有 rawid 时按页找**精确匹配**那条；引用图片可能来自
+                # 更早的历史（实测同一页也常见），所以允许多翻几页。
+                # 没有 rawid（如「刚发的图」）只看第一页即可。
+                pages = max(1, int(max_pages or 1)) if rawid else 1
+                media_url = ""
+                seen_any = False
+                for page in range(pages):
+                    payload = source.fetch_messages(
+                        talker, limit=50, media=True,
+                        # Alpha 默认升序（最旧在前）；要找「刚到的那张」必须倒序。
+                        # WeFlow 忽略 order，保持原行为。
+                        order="desc",
+                        offset=(page * 50) if page else None,
+                    )
+                    messages = payload if isinstance(payload, list) else payload.get(
+                        "messages", payload.get("data", []))
+                    if not isinstance(messages, list):
+                        messages = []
+                    candidates = [m for m in messages if extract_media_url(m)]
+                    if not candidates:
+                        continue
+                    seen_any = True
+                    if rawid:
+                        exact = [m for m in candidates
+                                 if str(extract_message_id(m)) == rawid
+                                 or str(m.get("rawid", "")) == rawid
+                                 or str(m.get("platform_message_id", "")) == rawid
+                                 or str(m.get("server_id", "")) == rawid]
+                        if exact:
+                            media_url = extract_media_url(exact[0])
+                            break
+                        # 本页没有 → 继续翻；全部翻完仍没有则放弃。
+                        continue
+                    media_url = extract_media_url(candidates[0])
+                    break
+                if not media_url:
+                    log.warning(f"取图失败: 消息列表里没有可用图片 (talker={talker}, "
+                                f"id={rawid or '-'}, pages={pages}, any={seen_any})")
                     return None
-                media_url = extract_media_url(candidates[0])
 
             if not media_url:
                 log.warning(f"取图失败: 消息记录没有媒体 URL (talker={talker})")

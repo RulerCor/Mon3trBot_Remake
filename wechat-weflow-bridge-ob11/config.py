@@ -221,6 +221,14 @@ PARSE_RICH_MESSAGES = bool(config.get("parse_rich_messages", True))
 STICKER_FETCH_ENABLED = bool(config.get("sticker_fetch_enabled", True))
 STICKER_MAX_BYTES = int(config.get("sticker_max_bytes", 4 * 1024 * 1024))
 
+# 引用图片回查：被引用的图片可能来自较早的历史消息，只查最新一页会找不到。
+# 值 = 最多翻几页（每页 50 条）。2 页=最近 100 条，足以覆盖日常引用场景；
+# 翻页只在「引用图片」这一条路径上发生，不影响普通取图。
+QUOTE_IMAGE_SEARCH_PAGES = max(1, int(config.get("quote_image_search_pages", 2)))
+# 推送前最多等引用图片回查多久（秒）。回查在收到消息时已并发启动、与缓冲
+# 窗口重叠；只有上游异常慢时才会真的等到这个上限，超时就只发文字。
+QUOTE_IMAGE_FETCH_TIMEOUT = float(config.get("quote_image_fetch_timeout", 20))
+
 # ============ 日志 ============
 
 # 文件日志必须带日期：bridge.log 只追加不滚动，跨天的行混在一起时

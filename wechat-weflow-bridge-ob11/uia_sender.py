@@ -949,8 +949,14 @@ class UiaSender(BaseSender):
         文本，判据失效，调用方传 verify=False。
         """
         def cleared() -> bool:
-            time.sleep(0.45)
-            return self._input_value(ctrl).strip() == ""
+            # 分层等待：立即读一次，最多仍等 0.45 秒；异常路径仍保留原预算。
+            deadline = time.time() + 0.45
+            while True:
+                if self._input_value(ctrl).strip() == "":
+                    return True
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.12)
 
         # 1) 发送按钮
         if self._send_button is not None:
@@ -1471,6 +1477,18 @@ class UiaSender(BaseSender):
     # 别人发的消息气泡靠左、自己发的靠右，所以**左右交替**试，两种都尽快命中。
     QUOTE_X_FRACTIONS = (0.38, 0.62, 0.28, 0.72, 0.18, 0.82, 0.5)
 
+    def _quote_x_candidates(self):
+        """右键候选顺序：先复用上次命中比例，再走保守默认序列。
+
+        只改顺序，不减少候选；预览校验不变，旧比例失效时继续完整扫描。
+        """
+        remembered = getattr(self, "_last_quote_x_fraction", None)
+        if remembered is not None:
+            return (remembered,) + tuple(
+                f for f in self.QUOTE_X_FRACTIONS if abs(f - remembered) > 1e-9
+            )
+        return self.QUOTE_X_FRACTIONS
+
     def _find_quote_menu(self, timeout: float = 1.2):
         """右键后找「引用」菜单项。
 
@@ -1531,15 +1549,16 @@ class UiaSender(BaseSender):
             return None
         y = top + max(6, int(h * 0.45))
 
-        for frac in self.QUOTE_X_FRACTIONS:
+        # 右键后立即轮询菜单，成功坐标不再固定等待 0.45 秒；总等待仍为 1 秒。
+        for frac in self._quote_x_candidates():
             x = int(left + w * frac)
             try:
                 auto.RightClick(x, y)
             except Exception:
                 continue
-            time.sleep(0.45)
             hit = self._find_quote_menu(timeout=1.0)
             if hit is not None:
+                self._last_quote_x_fraction = frac
                 log.info(f"引用：右键命中气泡（x≈{frac:.0%}），菜单已弹出")
                 return hit
             # 没弹出就换个位置；若刚才误开了别的菜单，点上方空白处关掉

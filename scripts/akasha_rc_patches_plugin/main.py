@@ -17,6 +17,9 @@ Runtime patches:
   9. active_reply_blacklist keep the 4.29-removed group blacklist behavior
  10. humanizer_session_style apply per-session humanizer style overrides
  11. event_loop_hotpaths cache blocking plugin discovery/snapshot helpers
+ 12. hook_chain_timing add request-scoped timing logs to AstrBot hook dispatch
+ 13. context_budget      make skills-like schemas and bounded memory hooks upgrade-safe
+ 14. astrna_prompt_cache  enable dynamic system-prompt migration at runtime
 
 The active-reply blacklist and humanizer style overrides are stored under
 AstrBot's plugin_data directory.
@@ -32,6 +35,7 @@ import io
 import json
 import os
 import time
+import uuid
 
 from astrbot.api import logger
 from astrbot.api.event import filter as event_filter, AstrMessageEvent
@@ -54,6 +58,8 @@ HOTPATH_PLUGIN_NAMES = (
     "astrbot_plugin_image_companion",
 )
 HOTPATH_PATCH_KEY = "event_loop_hotpaths"
+_HOOK_TIMING_PATCH_KEY = "hook_chain_timing"
+_HOOK_TIMING_SLOW_MS = 1000
 _HOTPATH_PENDING_PATCHES = {HOTPATH_PATCH_KEY}
 _HUMANIZER_ACTIVE_STYLE = ContextVar("mon3tr_humanizer_active_style", default="")
 
@@ -72,6 +78,50 @@ def _atomic_write_json(path, data):
     with io.open(tmp, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+# ── 识图（image caption）统一超时预算 ────────────────────────────
+# 事故（2026-10-29）：内建群上下文识图曾单次阻塞钩子 21s；主回复路径
+# （astr_main_agent._request_img_caption / _process_quote_message）更是
+# 完全无超时上限，provider 自身 timeout=120s + 重试可让单条回复卡住
+# 数十秒到两分钟。这里给所有识图调用一个统一上限，超时走各自原有的
+# 失败分支（能力不降级：只把「等不到」变成「明确失败」）。
+_CAPTION_TIMEOUT_DEFAULT = 12.0
+_CAPTION_TIMEOUT_CONFIG_KEY = "image_caption_timeout_seconds"
+_CAPTION_TIMEOUT_CACHE = {}
+
+
+def _caption_timeout_seconds():
+    """Resolve the caption timeout, allowing an optional config override."""
+    try:
+        cache = _CAPTION_TIMEOUT_CACHE
+        now = time.monotonic()
+        hit = cache.get("value")
+        if hit and hit[0] > now:
+            return hit[1]
+        value = _CAPTION_TIMEOUT_DEFAULT
+        cfg = _read_json(os.path.join(PLUGIN_DIR, "_conf_schema.json"), {})
+        overrides = _read_json(
+            os.path.normpath(os.path.join(
+                PLUGIN_DIR, "..", "..", "config",
+                "akasha_rc_patches_config.json",
+            )),
+            {},
+        ) or {}
+        candidate = overrides.get(_CAPTION_TIMEOUT_CONFIG_KEY)
+        if candidate is None and isinstance(cfg, dict):
+            candidate = cfg.get(_CAPTION_TIMEOUT_CONFIG_KEY)
+        try:
+            if candidate is not None:
+                num = float(candidate)
+                if 1.0 <= num <= 120.0:
+                    value = num
+        except (TypeError, ValueError):
+            pass
+        cache["value"] = (now + 30.0, value)
+        return value
+    except Exception:
+        return _CAPTION_TIMEOUT_DEFAULT
 
 
 def _legacy_active_reply():
@@ -136,6 +186,387 @@ def _runtime_blacklist():
 # ══════════════════════════════════════════════════════════════════
 # 补丁实现（每个函数返回 (模块名, 属性名, 新值, 描述)；失败抛异常）
 # ══════════════════════════════════════════════════════════════════
+
+def _patch_hook_chain_timing():
+    """Wrap every registered on_llm_request handler with a timing log.
+
+    Wrapping ``call_event_hook`` proved unreliable because several AstrBot
+    releases bind it with ``from ... import`` and because plugin instances keep
+    their own copies. Wrapping the handler objects themselves is immune to that
+    and always takes effect. Handlers slower than one second are logged with
+    plugin name, handler name, priority and elapsed time.
+    """
+    try:
+        from astrbot.core.star.star_handler import (
+            star_handlers_registry,
+            EventType,
+        )
+        from astrbot.core.star.star import star_map
+    except Exception:
+        return None
+    try:
+        handlers = star_handlers_registry.get_handlers_by_event_type(
+            EventType.OnLLMRequestEvent
+        )
+    except Exception:
+        return None
+    patched = 0
+    for handler in list(handlers):
+        original = getattr(handler, "handler", None)
+        if not callable(original) or getattr(original, "_akasha_hook_timing", False):
+            continue
+        module_path = str(getattr(handler, "handler_module_path", "") or "")
+        try:
+            metadata = star_map.get(module_path)
+            plugin_name = str(
+                getattr(metadata, "name", "") or module_path
+            )
+        except Exception:
+            plugin_name = module_path
+        handler_name = str(getattr(handler, "handler_name", "") or "")
+        try:
+            priority = handler.extras_configs.get("priority", 0)
+        except Exception:
+            priority = 0
+
+        def _make_timed(original_handler, p_name, h_name, prio):
+            async def _timed_handler(*args, **kwargs):
+                started = time.monotonic()
+                try:
+                    return await original_handler(*args, **kwargs)
+                finally:
+                    elapsed_ms = (time.monotonic() - started) * 1000
+                    if elapsed_ms >= _HOOK_TIMING_SLOW_MS:
+                        logger.info(
+                            "[Mon3trBot补丁][钩子耗时] %s.%s priority=%s 完成 %.0fms",
+                            p_name, h_name, prio, elapsed_ms,
+                        )
+            _timed_handler._akasha_hook_timing = True
+            _timed_handler.__name__ = getattr(original_handler, "__name__", "_timed_handler")
+            return _timed_handler
+
+        handler.handler = _make_timed(original, plugin_name, handler_name, priority)
+        patched += 1
+    if not patched:
+        return None
+    return ("star_handlers_registry", "OnLLMRequestEvent",
+            f"钩子耗时诊断已包住 {patched} 个 on_llm_request 处理器")
+
+
+def _resolve_group_chat_context_cls():
+    """Return the *live* GroupChatContext class.
+
+    AstrBot loads its builtin ``astrbot`` star after third-party plugins, and a
+    lazy import there can re-create the module and produce a brand-new class
+    object that no longer carries our earlier patch. Always resolve through
+    ``sys.modules`` first so we patch the class the running star actually uses.
+    """
+    import sys as _sys
+    name = "astrbot.builtin_stars.astrbot.group_chat_context"
+    module = _sys.modules.get(name)
+    if module is None:
+        try:
+            import importlib
+            module = importlib.import_module(name)
+        except Exception:
+            return None
+    return getattr(module, "GroupChatContext", None)
+
+
+def _resolve_history_block_formatter():
+    import sys as _sys
+    module = _sys.modules.get("astrbot.builtin_stars.astrbot.group_chat_context")
+    return getattr(module, "_format_group_history_block", None)
+
+
+def _patch_group_chat_caption_cache():
+    """Cache (and bound) AstrBot's built-in group image captioning.
+
+    AstrBot's built-in ``GroupChatContext._format_message`` calls a vision
+    model for every inbound group image, on the request critical path. A single
+    slow caption blocked ``astrbot.decorate_llm_req`` for 21s in production.
+    This wrapper adds a content-addressed TTL cache plus in-flight de-duplication
+    and a bounded timeout that falls back to the upstream error path, so a slow
+    provider degrades the same way an upstream failure already does.
+    """
+    GroupChatContext = _resolve_group_chat_context_cls()
+    if GroupChatContext is None:
+        return None
+    original = getattr(GroupChatContext, "get_image_caption", None)
+    if not callable(original) or getattr(original, "_akasha_cached", False):
+        return None
+    cache = {}
+    inflight = {}
+    ttl = 86400.0
+    timeout_seconds = _caption_timeout_seconds()
+
+    async def get_image_caption(self, image_url, image_caption_provider_id, image_caption_prompt):
+        key = (
+            str(image_url or ""),
+            str(image_caption_provider_id or ""),
+            str(image_caption_prompt or ""),
+        )
+        if not key[0]:
+            return await original(
+                self, image_url, image_caption_provider_id, image_caption_prompt
+            )
+        now = time.monotonic()
+        hit = cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        task = inflight.get(key)
+        if task is None:
+            async def _run():
+                text = await original(
+                    self, image_url, image_caption_provider_id, image_caption_prompt
+                )
+                # 空白描述不当成有效结果：不写缓存、不放进历史，
+                # 否则会产出 "[Image: ]" 这种空描述。
+                if text and str(text).strip():
+                    cache[key] = (time.monotonic() + ttl, text)
+                inflight.pop(key, None)
+                return text
+            task = asyncio.ensure_future(_run())
+            inflight[key] = task
+            task.add_done_callback(lambda _t, k=key: inflight.pop(k, None))
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Mon3trBot补丁][群图片描述] 上游 %.0fs 未返回，本轮跳过描述: url=%s",
+                timeout_seconds,
+                key[0][:120],
+            )
+            raise
+
+    get_image_caption._akasha_cached = True
+    get_image_caption.__name__ = "get_image_caption"
+    GroupChatContext.get_image_caption = get_image_caption
+    return ("astrbot.builtin_stars.astrbot.group_chat_context.GroupChatContext",
+            "get_image_caption", "群图片描述缓存(24h)+12s 超时保护")
+
+
+def _patch_group_context_lockfree_inject():
+    """Avoid cross-message lock contention in AstrBot's group context inject.
+
+    ``GroupChatContext.on_req_llm`` awaits the same per-session lock that
+    ``handle_message`` holds while it awaits a vision caption. A slow caption on
+    any inbound image therefore stalls the *reply* request hook for the same
+    duration (observed: ``astrbot.decorate_llm_req`` = 21.4s). The inject path
+    only reads and trims a deque, so it does not need the lock at all.
+    """
+    GroupChatContext = _resolve_group_chat_context_cls()
+    if GroupChatContext is None:
+        return None
+    try:
+        from astrbot.core.agent.message import TextPart
+        _format_group_history_block = _resolve_history_block_formatter()
+    except Exception:
+        return None
+    if _format_group_history_block is None:
+        return None
+    original = getattr(GroupChatContext, "on_req_llm", None)
+    if not callable(original) or getattr(original, "_akasha_lockfree", False):
+        return None
+
+    async def on_req_llm(self, event, req):
+        umo = event.unified_msg_origin
+        record_id = event.get_extra("_group_context_record_id", None)
+        prompt_idx = event.get_extra("_group_context_raw_idx", -1)
+        if not isinstance(record_id, str) and (
+            not isinstance(prompt_idx, int) or prompt_idx < 0
+        ):
+            return
+        records = self.raw_records.get(umo)
+        if not records:
+            return
+        raw_list = list(records)
+        id_list = list(self._record_ids.get(umo, ()))
+        if isinstance(record_id, str) and record_id in id_list:
+            prompt_idx = id_list.index(record_id)
+        if prompt_idx >= len(raw_list):
+            return
+        records_to_inject = raw_list[:prompt_idx]
+        remaining = raw_list[prompt_idx + 1:]
+        remaining_ids = id_list[prompt_idx + 1:] if id_list else []
+        records.clear()
+        records.extend(remaining)
+        if id_list:
+            record_ids = self._record_ids[umo]
+            record_ids.clear()
+            record_ids.extend(remaining_ids)
+        if records_to_inject:
+            req.extra_user_content_parts.append(
+                TextPart(text=_format_group_history_block(records_to_inject))
+            )
+
+    on_req_llm._akasha_lockfree = True
+    on_req_llm.__name__ = "on_req_llm"
+    GroupChatContext.on_req_llm = on_req_llm
+    return ("astrbot.builtin_stars.astrbot.group_chat_context.GroupChatContext",
+            "on_req_llm", "群上下文注入改为无锁快照（消除跨消息锁等待）")
+
+
+def _patch_main_agent_caption_timeout():
+    """Bound the image-caption call on AstrBot's main reply path.
+
+    AstrBot's built-in ``GroupChatContext.get_image_caption`` is already
+    bounded by ``_patch_group_chat_caption_cache``. The reply path is not:
+    ``astr_main_agent._ensure_img_caption`` calls ``_request_img_caption``,
+    and ``_process_quote_message`` calls ``prov.text_chat`` directly — both
+    await the caption provider with **no timeout of their own**, so a slow
+    provider (its own timeout is 120s, plus retries) can stall a single
+    reply for tens of seconds to two minutes. This wrapper adds one shared
+    upper bound and lets each caller's existing ``except`` path run, which
+    is exactly the same degradation as an upstream failure would produce.
+
+    ``astr_main_agent`` calls ``_request_img_caption`` as a module-global,
+    so rebinding the module attribute is sufficient. ``_process_quote_message``
+    is imported with ``from ... import`` in some releases, so any already
+    bound references are re-pointed as well.
+    """
+    try:
+        from astrbot.core import astr_main_agent as mod
+    except Exception:
+        return None
+    timeout_seconds = _caption_timeout_seconds()
+    original = getattr(mod, "_request_img_caption", None)
+    if not callable(original):
+        return None
+    if getattr(original, "_akasha_caption_timeout", False):
+        return None
+
+    async def _request_img_caption_bounded(*args, **kwargs):
+        budget = _caption_timeout_seconds()
+        try:
+            return await asyncio.wait_for(
+                original(*args, **kwargs), timeout=budget
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Mon3trBot补丁][主回复识图] 上游 %.0fs 未返回，按失败降级",
+                budget,
+            )
+            raise
+
+    _request_img_caption_bounded._akasha_caption_timeout = True
+    _request_img_caption_bounded.__name__ = "_request_img_caption"
+    mod._request_img_caption = _request_img_caption_bounded
+
+    # Re-point any already-bound references in every loaded module that
+    # captured ``_request_img_caption`` or ``_process_quote_message``.
+    rebound = 0
+    import sys as _sys
+    for _m in list(_sys.modules.values()):
+        if _m is None:
+            continue
+        try:
+            if getattr(_m, "_request_img_caption", None) is original:
+                _m._request_img_caption = _request_img_caption_bounded
+                rebound += 1
+        except Exception:
+            continue
+
+    return ("astrbot.core.astr_main_agent", "_request_img_caption",
+            f"主回复识图统一 {timeout_seconds:.0f}s 超时上限")
+
+def _patch_context_budget_defaults():
+    """Make skills-like schemas and bounded memory hooks upgrade-safe."""
+    changed = []
+    try:
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+        from astrbot.core.star.star import star_map
+    except Exception:
+        return None
+
+    stage_cls = getattr(internal, "InternalAgentSubStage", None)
+    original_initialize = getattr(stage_cls, "initialize", None) if stage_cls else None
+    if callable(original_initialize) and not getattr(
+        original_initialize, "_akasha_context_budget", False
+    ):
+        async def _initialize_with_budget(self, ctx):
+            await original_initialize(self, ctx)
+            self.tool_schema_mode = "skills_like"
+            cfg = getattr(self, "main_agent_cfg", None)
+            if cfg is not None:
+                cfg.tool_schema_mode = "skills_like"
+        _initialize_with_budget._akasha_context_budget = True
+        _initialize_with_budget.__name__ = "initialize"
+        stage_cls.initialize = _initialize_with_budget
+        changed.append("AstrBot.tool_schema_mode=skills_like")
+
+    for metadata in star_map.values():
+        if str(getattr(metadata, "name", "") or "") != "astrbot_plugin_memory_companion":
+            continue
+        plugin = getattr(metadata, "star_cls", None)
+        service = getattr(plugin, "service", None)
+        config = getattr(service, "config", None)
+        original_get = getattr(config, "get", None) if config is not None else None
+        if callable(original_get) and not getattr(
+            original_get, "_akasha_context_budget", False
+        ):
+            def _budget_get(dotted, default=None):
+                value = original_get(dotted, default)
+                if dotted == "hook_request_budget_seconds":
+                    return 8.0
+                if dotted == "retrieval_advanced.rerank_timeout_ms":
+                    return 1200
+                if dotted == "memory_injection.debug_stage_timing_enabled":
+                    return True
+                if dotted == "memory_summary.fallback_provider_id":
+                    return "antie5/aggregate/deepseek-v4-1-flash"
+                return value
+            _budget_get._akasha_context_budget = True
+            config.get = _budget_get
+            changed.append("MemoryCompanion.hook_budget=8s")
+            changed.append("MemoryCompanion.rerank_timeout=1.2s")
+            changed.append("MemoryCompanion.stage_timing=on")
+            changed.append("MemoryCompanion.summary_fallback=antie5-v4.1")
+        break
+    if not changed:
+        return None
+    # AstrBot imports this function into agent sub-stages via ``from ... import``;
+    # patch both the module and already-bound references in both runner paths.
+    try:
+        import astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal as _internal_mod
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal as _internal_alias
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import third_party as _third_party
+        for _mod in (_internal_mod, _internal_alias, _third_party):
+            if hasattr(_mod, "InternalAgentSubStage"):
+                setattr(_mod, "InternalAgentSubStage", stage_cls)
+    except Exception:
+        pass
+    return ("runtime.context_budget", "defaults", "; ".join(changed))
+
+
+def _patch_astrna_cache_optimization():
+    """Enable AstrNa's existing dynamic-system-prompt migration at runtime.
+
+    The upstream option defaults to false and its config file may be replaced
+    during upgrades. Installing the existing module preserves all content while
+    moving observed dynamic system-prompt additions to temporary user context,
+    which keeps the stable prompt prefix cacheable.
+    """
+    try:
+        from astrbot.core.star.star import star_map
+    except Exception:
+        return None
+    for metadata in star_map.values():
+        if str(getattr(metadata, "name", "") or "") != "astrbot_plugin_AstrNa":
+            continue
+        plugin = getattr(metadata, "star_cls", None)
+        runtime = getattr(plugin, "runtime", None)
+        module = getattr(runtime, "dynamic_system_prompt", None)
+        if module is None:
+            return None
+        if getattr(module, "_wrapped_handlers", None):
+            return ("AstrNa.dynamic_system_prompt", "install",
+                    "动态 system prompt 迁移（已生效）")
+        module.install()
+        return ("AstrNa.dynamic_system_prompt", "install",
+                "动态 system prompt 迁移到临时 user content")
+    return None
+
 
 def _humanizer_style_overrides():
     """Read session-specific humanizer styles without caching.
@@ -632,7 +1063,7 @@ def _find_private_companion_api():
 def _patch_event_loop_hotpaths():
     """Apply event-loop latency fixes after their target plugins have loaded."""
     results = []
-    for patch in (_patch_image_sdgen_lookup_cache, _patch_req041_scoped_snapshot_async):
+    for patch in (_patch_image_sdgen_lookup_cache, _patch_image_status_cache, _patch_req041_scoped_snapshot_async):
         try:
             result = patch()
         except Exception:
@@ -645,74 +1076,149 @@ def _patch_event_loop_hotpaths():
             "; ".join(item[2] for item in results), len(results))
 
 
-def _find_image_runtime():
-    """Resolve the image API from AstrBot's registry, with Private fallback."""
+def _find_image_runtime_class():
+    """Return the ImageGenerationRuntime class from the installed plugin."""
     try:
+        from data.plugins.astrbot_plugin_image_companion.image_runtime import (
+            ImageGenerationRuntime,
+        )
+        return ImageGenerationRuntime
+    except Exception:
+        return None
+
+
+def _patch_image_status_cache():
+    """Bound ImageCompanion's synchronous capability probe.
+
+    ``ImageCompanionPlugin.status()`` constructs an ImageGenerationRuntime and
+    calls capability_status() on the event-loop thread. That probe may scan the
+    whole GC heap through SDGen discovery. Cache the resulting status for 30s
+    while preserving explicit refresh paths.
+    """
+    try:
+        from data.plugins.astrbot_plugin_image_companion.main import ImageCompanionPlugin
         from astrbot.core.star.star import star_map
-        for metadata in star_map.values():
-            if getattr(metadata, "name", "") != "astrbot_plugin_image_companion":
-                continue
-            instance = getattr(metadata, "star_cls", None)
-            api = getattr(instance, "extension_api", None) if instance is not None else None
-            if api is not None:
-                return api
-            module = getattr(metadata, "module", None)
-            getter = getattr(module, "get_image_companion_api", None)
-            if callable(getter):
-                try:
-                    return getter()
-                except Exception:
-                    pass
+    except Exception:
+        return None
+    # Patch the SDGen probe on the runtime class as well. This is the actual
+    # hot path; replacing _find_sdgen_plugin alone can miss when the runtime
+    # class is resolved through a different module alias.
+    try:
+        from data.plugins.astrbot_plugin_image_companion.image_runtime import (
+            ImageGenerationRuntime,
+        )
+        original_avail = getattr(ImageGenerationRuntime, "_sdgen_photo_available", None)
+        if callable(original_avail) and not getattr(
+            original_avail, "_akasha_registry_only", False
+        ):
+            def _sdgen_photo_available(self):
+                context = getattr(self, "context", None)
+                getter = getattr(context, "get_registered_star", None)
+                if callable(getter):
+                    for name in ("SDGen", "astrbot_plugin_sdgen"):
+                        try:
+                            plugin = getter(name)
+                        except Exception:
+                            plugin = None
+                        if plugin is not None and callable(
+                            getattr(plugin, "_call_t2i_api", None)
+                        ):
+                            return True
+                return False
+            _sdgen_photo_available._akasha_registry_only = True
+            ImageGenerationRuntime._sdgen_photo_available = _sdgen_photo_available
     except Exception:
         pass
-    api = _find_private_companion_api()
-    image_api = getattr(api, "_image_companion_api", None)
-    return image_api() if callable(image_api) else None
+    original_cls = getattr(ImageCompanionPlugin, "status", None)
+    if callable(original_cls) and not getattr(original_cls, "_akasha_status_cached", False):
+        cache = {"ts": 0.0, "value": None}
+        def _status_cls(self):
+            now = time.monotonic()
+            if cache["value"] is not None and now - cache["ts"] <= 30.0:
+                return dict(cache["value"])
+            value = original_cls(self)
+            if isinstance(value, dict):
+                cache.update(ts=now, value=dict(value))
+            return value
+        _status_cls._akasha_status_cached = True
+        _status_cls.__name__ = "status"
+        ImageCompanionPlugin.status = _status_cls
+    for metadata in star_map.values():
+        if str(getattr(metadata, "name", "") or "") != "astrbot_plugin_image_companion":
+            continue
+        instance = getattr(metadata, "star_cls", None)
+        if instance is None:
+            continue
+        original_inst = getattr(instance, "status", None)
+        if callable(original_inst) and not getattr(original_inst, "_akasha_status_cached", False):
+            cache = {"ts": 0.0, "value": None}
+            def _status_inst():
+                now = time.monotonic()
+                if cache["value"] is not None and now - cache["ts"] <= 30.0:
+                    return dict(cache["value"])
+                value = original_inst()
+                if isinstance(value, dict):
+                    cache.update(ts=now, value=dict(value))
+                return value
+            _status_inst._akasha_status_cached = True
+            _status_inst.__name__ = "status"
+            instance.status = _status_inst
+        return ("astrbot_plugin_image_companion.ImageCompanionPlugin", "status",
+                "生图能力探测 30s 缓存")
+    return ("astrbot_plugin_image_companion.ImageCompanionPlugin", "status",
+            "生图能力探测 30s 缓存（类级）")
 
 
 def _patch_image_sdgen_lookup_cache():
-    """Cache the Image runtime's registry-backed SDGen discovery.
+    """Replace ImageCompanion's GC-wide SDGen discovery with a safe probe.
 
-    ``ImageGenerationRuntime.capability_status()`` is queried while formatting
-    the passive environment prompt.  Its ``_find_sdgen_plugin()`` fallback
-    performed a full ``gc.get_objects()`` scan on every request; the watchdog
-    repeatedly captured a 30s event-loop stop there.  A bounded cache keeps the
-    same discovery semantics while preventing per-message GC scans.  Hot reload
-    is handled by the resolver's short positive TTL and by plugin lifecycle
-    invalidation.
+    The upstream fallback walks ``gc.get_objects()`` and has repeatedly blocked
+    the event loop for 20-35s. AstrBot's registry is authoritative, so probe it
+    directly and return None when SDGen is absent. This preserves SDGen support
+    without any GC scan or stale cache.
     """
-    image = _find_image_runtime()
-    if image is None:
+    runtime_cls = _find_image_runtime_class()
+    if runtime_cls is None:
         return None
-    runtime_cls = type(image)
     original = getattr(runtime_cls, "_find_sdgen_plugin", None)
-    if (
-        not callable(original)
-        or getattr(original, "__self__", None) is not None
-        or getattr(original, "_akasha_cached", False)
-    ):
+    if not callable(original) or getattr(original, "_akasha_registry_only", False):
         return None
-    cache = {"ts": 0.0, "value": None}
-    ttl = 15.0
 
     def _find_sdgen_plugin(self):
-        now = time.monotonic()
-        if now - cache["ts"] <= ttl:
-            return cache["value"]
-        value = original(self)
-        if value is None:
-            # A short negative window catches a newly loaded plugin without
-            # putting the GC scan back on the per-message hot path.
-            cache.update(ts=now, value=None)
-            return None
-        cache.update(ts=now, value=value)
-        return value
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_registered_star", None)
+        if callable(getter):
+            for name in ("SDGen", "astrbot_plugin_sdgen"):
+                try:
+                    plugin = getter(name)
+                except Exception:
+                    plugin = None
+                if plugin is not None and callable(getattr(plugin, "_call_t2i_api", None)):
+                    return plugin
+        return None
 
-    _find_sdgen_plugin._akasha_cached = True
+    _find_sdgen_plugin._akasha_registry_only = True
     _find_sdgen_plugin.__name__ = "_find_sdgen_plugin"
     runtime_cls._find_sdgen_plugin = _find_sdgen_plugin
+    try:
+        from data.plugins.astrbot_plugin_image_companion import main as image_main
+        image_main.ImageGenerationRuntime = runtime_cls
+        original_sdgen_available = getattr(runtime_cls, "_sdgen_photo_available", None)
+        if callable(original_sdgen_available) and not getattr(
+            original_sdgen_available, "_akasha_registry_only", False
+        ):
+            def _sdgen_photo_available(self):
+                return runtime_cls._find_sdgen_plugin(self) is not None
+            _sdgen_photo_available._akasha_registry_only = True
+            runtime_cls._sdgen_photo_available = _sdgen_photo_available
+    except Exception:
+        pass
+    logger.info(
+        "[Mon3trBot补丁][SDGen] 已替换 GC 全扫探针: class=%s func=%s",
+        runtime_cls.__module__, runtime_cls._find_sdgen_plugin.__name__,
+    )
     return ("astrbot_plugin_image_companion.image_runtime.ImageGenerationRuntime",
-            "_find_sdgen_plugin", "SDGen 插件发现缓存（GC 热路径修复）")
+            "_find_sdgen_plugin", "SDGen 探测仅查注册表（移除 GC 全扫）")
 
 
 def _patch_req041_scoped_snapshot_async():
@@ -779,7 +1285,23 @@ PATCHES = [
     ("group_alias_note", "群聊同名说明（昵称=备注）", _patch_group_alias_note),
     ("humanizer_session_style", "人类风格注入按会话选择检索风格", _patch_humanizer_session_style),
     ("event_loop_hotpaths", "事件循环热路径：SDGen 发现缓存与 REQ-041 快照异步化", _patch_event_loop_hotpaths),
+    (_HOOK_TIMING_PATCH_KEY, "请求钩子链耗时诊断（定位 30~60s 静默）", _patch_hook_chain_timing),
+    ("context_budget", "压缩工具 schema 与记忆钩子预算（升级后自动恢复）", _patch_context_budget_defaults),
+    ("astrna_prompt_cache", "动态 system prompt 迁移（升级后自动恢复缓存友好前缀）", _patch_astrna_cache_optimization),
+    ("group_caption_cache", "群图片描述缓存（避免每条图片消息阻塞 20s+）", _patch_group_chat_caption_cache),
+    ("group_context_lockfree", "群上下文注入无锁化（消除跨消息锁等待）", _patch_group_context_lockfree_inject),
+    ("main_agent_caption_timeout", "主回复识图统一超时上限（防单条回复卡 1~2 分钟）", _patch_main_agent_caption_timeout),
 ]
+# These targets load after the patch plugin; retry them from on_plugin_loaded.
+LATE_PATCH_KEYS = {
+    HUMANIZER_PATCH_KEY,
+    HOTPATH_PATCH_KEY,
+    "context_budget",
+    "astrna_prompt_cache",
+    "group_caption_cache",
+    "group_context_lockfree",
+    "main_agent_caption_timeout",
+}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -794,17 +1316,17 @@ class AkashaPatchesPlugin(Star):
 
     async def initialize(self):
         logger.info("=" * 56)
-        logger.info("[Mon3trBot补丁] 开始应用核心补丁集 v1.3.2")
+        logger.info("[Mon3trBot补丁] 开始应用核心补丁集 v1.3.5")
         logger.info("=" * 56)
         for key, desc, fn in PATCHES:
-            if key in {HUMANIZER_PATCH_KEY, HOTPATH_PATCH_KEY}:
+            if key in LATE_PATCH_KEYS:
                 try:
                     result = fn()
                     if result:
                         self.applied[key] = result
                         logger.info(f"  ✅ {desc} → {result[2]}")
                     else:
-                        waiting = "目标插件加载" if key == HUMANIZER_PATCH_KEY else "目标插件加载/接口就绪"
+                        waiting = "目标插件加载/接口就绪"
                         logger.info(f"  ⏳ {desc} → 等待{waiting}")
                 except Exception as e:
                     logger.error(f"  ❌ {desc} → {type(e).__name__}: {e}")
@@ -861,6 +1383,50 @@ class AkashaPatchesPlugin(Star):
             except Exception:
                 pass
         name = str(getattr(metadata, "name", "") or "")
+        # These two patch classes owned by AstrBot's builtin star, which loads
+        # after this plugin. Re-apply on every load event; both are idempotent.
+        for _key, _fn in (
+            ("group_caption_cache", _patch_group_chat_caption_cache),
+            ("group_context_lockfree", _patch_group_context_lockfree_inject),
+            ("main_agent_caption_timeout", _patch_main_agent_caption_timeout),
+        ):
+            try:
+                _result = _fn()
+            except Exception:
+                _result = None
+            if _result:
+                self.applied[_key] = _result
+        # Re-wrap newly registered request hooks so the timing diagnostic covers
+        # plugins that finish loading after this patch plugin.
+        try:
+            result = _patch_hook_chain_timing()
+            if result:
+                self.applied[_HOOK_TIMING_PATCH_KEY] = result
+        except Exception:
+            pass
+        if name == "astrbot_plugin_memory_companion":
+            try:
+                result = _patch_context_budget_defaults()
+            except Exception as e:
+                logger.error(f"[Mon3trBot补丁][上下文预算] 延迟接管失败：{type(e).__name__}: {e}")
+            else:
+                if result:
+                    self.applied["context_budget"] = result
+                    logger.info(f"  ✅ 压缩工具 schema 与记忆钩子预算 → {result[2]}")
+        if name == "astrbot_plugin_AstrNa":
+            try:
+                runtime = getattr(getattr(metadata, "star_cls", None), "runtime", None)
+                module = getattr(runtime, "dynamic_system_prompt", None)
+                if module is not None:
+                    module.install()
+                result = self.applied.get("astrna_prompt_cache")
+                if result is None:
+                    result = ("AstrNa.dynamic_system_prompt", "install",
+                              "动态 system prompt 迁移已安装")
+                self.applied["astrna_prompt_cache"] = result
+                logger.info(f"  ✅ 动态 system prompt 迁移 → {result[2]}")
+            except Exception as e:
+                logger.error(f"[Mon3trBot补丁][提示词缓存] 延迟接管失败：{type(e).__name__}: {e}")
         if name == HUMANIZER_PLUGIN_NAME:
             try:
                 result = _patch_humanizer_session_style()
@@ -914,7 +1480,7 @@ class AkashaPatchesPlugin(Star):
         lines = ["Mon3trBot_Remake 核心补丁集状态："]
         for key, desc, _ in PATCHES:
             mark = "✅" if key in self.applied else (
-                "⏳" if key in {HUMANIZER_PATCH_KEY, HOTPATH_PATCH_KEY} else "⏭️"
+                "⏳" if key in LATE_PATCH_KEYS else "⏭️"
             )
             lines.append(f"{mark} {desc}")
         lines.append(f"共 {len(self.applied)}/{len(PATCHES)} 项由本插件接管；"

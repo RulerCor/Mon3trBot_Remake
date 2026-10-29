@@ -125,7 +125,8 @@ class BaseMessageSource:
         raise NotImplementedError
 
     def fetch_messages(self, talker: str, *, limit: int = 5,
-                       media: bool = False, order: str | None = None) -> dict:
+                       media: bool = False, order: str | None = None,
+                       offset: int | None = None) -> dict:
         raise NotImplementedError
 
     def download_media(self, url: str) -> requests.Response:
@@ -190,7 +191,9 @@ class WeFlowSource(BaseMessageSource):
         return r.json().get("members") or []
 
     def fetch_messages(self, talker: str, *, limit: int = 5,
-                       media: bool = False, order: str | None = None) -> dict:
+                       media: bool = False, order: str | None = None,
+                       offset: int | None = None) -> dict:
+        # WeFlow 老接口不支持 offset 分页，收下参数但不转发（保持原行为）。
         params = {
             "access_token": config.ACCESS_TOKEN,
             "talker": talker,
@@ -328,7 +331,8 @@ class AlphaSource(BaseMessageSource):
         return r.json().get("members") or []
 
     def fetch_messages(self, talker: str, *, limit: int = 5,
-                       media: bool = False, order: str | None = None) -> dict:
+                       media: bool = False, order: str | None = None,
+                       offset: int | None = None) -> dict:
         account = self.ensure_account()
         params = {
             "account_id": account,
@@ -340,6 +344,9 @@ class AlphaSource(BaseMessageSource):
         if order:
             # Alpha 支持 desc；默认是升序（最旧在前），取「刚到的新图」必须倒序。
             params["order"] = order
+        if offset:
+            # 引用图片可能来自较早的历史消息，只查首页会找不到 —— 支持翻页。
+            params["offset"] = int(offset)
         r = self._get("/api/v1/messages", params=params, timeout=30)
         if r.status_code != 200:
             raise MessageSourceError(f"Alpha messages HTTP {r.status_code}")

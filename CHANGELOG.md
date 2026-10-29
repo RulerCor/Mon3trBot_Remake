@@ -1,5 +1,31 @@
 # 开发日志
 
+## v1.9.2 — 回复链路提速与引用图片修复（2026-10-29）
+
+### 修复
+
+- **引用图片收不到（桥接丢弃图片元数据）**：微信引用一张图片时，被引用正文只是一句「〔引用 某某：[图片]〕」，旧 `wx_msg_parser._parse_quote` 只判 `<img` 就写死 `[图片]`，`md5`/`svrid`/`length` 全丢，AstrBot 侧 `_private_event_has_image` 为 false、永远不触发识图，模型只能答“看不清”（事故日志 21:15:02 收到 quote、21:15:07 只推送 1 条消息 + 0 张图片）。现在解析层用 `_raw_tag` 单独取未解码的 `refermsg`（避免内嵌 XML 标签“浮”上来误命中），解出 `svrid`/`md5`/`aeskey`/`size`/`url_kind` 存入 `ParsedMessage.extra["quote_image"]`，`text` 结构保持不变。
+- **引用图片回查与下载**：`bridge_core._handle_rich_message` 对 `KIND_QUOTE` + `quote_image` 走 `_fetch_quote_image_segment()`，用 `refermsg.svrid` 命中 Alpha 历史里同一条图片消息（该消息自带已 resolve 的 `media.resources[].url`，无需触碰 aeskey/CDN 解密），下载后作为标准 OneBot image 段与文字一起投递，AstrBot 原生识图路径即可生效。`/api/v1/messages` 支持 `offset` 分页，`message_source.fetch_messages` 三处实现补 `offset` 参数（WeFlow 收下不转发）；每页 `limit=50`（>100 会触发 422 `media.hydration_budget_exceeded`），`config.QUOTE_IMAGE_SEARCH_PAGES`（默认 2 页=最近 100 条）只在引用图片这条路径上翻页，不影响普通取图。
+- **能力不缩水**：图片下载失败或没有 `svrid`（例如引用的是文本）时，`[图片]` 文本照常推送，只是没有 image 段 —— 行为退回改动前，只增不减。
+- **回查不阻塞消息接收**：回查历史实测每页 ~4s，翻 2 页 + 下载接近 10s。第一版把下载写在 SSE 接收线程里，会把这 10s 加到**所有会话**的消息接收上。现在改成收到消息时立即在后台线程并发启动回查（`_start_quote_image_fetch`），与 5s 缓冲窗口重叠，推送时只等剩余时间（`_await_quote_image_segment`，上限 `QUOTE_IMAGE_FETCH_TIMEOUT`=20s）：启动调用实测 **6ms** 返回，典型总回查 6.1s，净增推送延迟约 1s，接收线程全程不被网络 I/O 占住。每个会话独立排队，慢会话只影响自己。
+
+### 优化
+
+- **原生引用回复提速**：右键气泡命中比例按最近一次成功值优先复用，候选坐标不减少、引用预览校验保留；右键后立即轮询菜单，去掉成功路径的固定 0.45s 等待；发送清空校验改为分层等待（最长仍为 0.45s）。
+- **AstrBot 上下文加载优化**：LLM 工具 schema 由 `akasha_rc_patches` 在运行时切到 `skills_like` 两阶段模式，所有工具能力保留，但首轮不再下发 81 个完整 JSON Schema；由 `akasha_rc_patches` 在运行时启用 AstrNa 现有动态 system prompt 迁移模块，把观察到的动态注入移到临时 user content；动态时间提醒本就位于每轮 user content，不污染 system prompt 前缀，利于 prompt cache 命中。
+- **MemoryCompanion 请求钩子保底**：由 `akasha_rc_patches` 提供 8s 总预算兜底与阶段耗时日志，避免记忆检索/重排异常把整轮回复拖进 30~60s 黑洞；rerank 超时从 3s 收紧到 1.2s；阶段性总结 fallback 不再使用余额受限的 tokenrhythm，改为当前可用的 antie5 v4.1 flash。
+- **AstrBot 钩子链诊断（akasha_rc_patches v1.3.3）**：为所有事件钩子加 request 级耗时日志，超过 1s 的钩子会记录插件、handler、优先级和耗时。
+- **AstrBot 内建群上下文阻塞修复（akasha_rc_patches v1.3.4）**：钩子级计时抓到 `astrbot.decorate_llm_req` 单次耗时 **21.3 秒**，根因是内建 `GroupChatContext` 对每条入站群图片同步调视觉模型补描述，且 `on_req_llm` 与 `handle_message` 抢同一把会话锁。运行时改为：图片描述做 24h 内容寻址缓存 + 12s 超时降级、注入路径改无锁快照；实测钩子耗时从 21s 降到秒级。
+- **Image Companion 事件循环阻塞修复（akasha_rc_patches v1.3.3）**：watchdog 抓到 `ImageGenerationRuntime._sdgen_photo_available()` 走 `_find_sdgen_plugin()` 的 `gc.get_objects()` 全量扫描，单次阻塞事件循环 21~36 秒，是回复慢的主因；运行时接管改为只查 AstrBot 注册表并加 30 秒生图能力状态缓存，SDGen 可选能力保持可用，彻底移除这条 GC 热路径。
+- **主回复识图超时上限（akasha_rc_patches v1.3.5）**：内建 `GroupChatContext.get_image_caption` 已被 v1.3.4 加了 12s 超时，但**主回复路径**（`astr_main_agent._request_img_caption`）此前完全没有上限 —— provider 自身 `timeout=120s` 加多次重试，最坏能让单条回复卡住数十秒到两分钟。v1.3.5 统一给识图调用加 12s 上限（可用插件配置 `image_caption_timeout_seconds` 覆盖），超时走各调用点原有的失败分支，与「上游失败」降解方式完全一致，能力不缩水；同时群图片描述遇到空白返回不再写缓存，避免产出 `[Image: ]` 空描述。
+
+### 验证
+
+- `uia_sender.py` 语法自检通过；`sync_to_rc.py` 同步与语法自检通过。
+- 引用图片回归测试 `scripts/test_quote_image.py` 17/17 通过（解析层 / 投递层 mock 下载 / 降级层）；`test_bridge_rich_msg.py` 12/12 通过无回归。
+- 生产配置实测回查：`svrid=7066182232866673373` 命中历史记录并下载到 **87998 字节** PNG，与引用 XML 的 `length` 精确一致（端到端验证通过，未发送任何消息）。
+- 并发回查实测：`_start_quote_image_fetch` 返回耗时 **6ms**、后台回查 6.10s、结果 image 段正常生成 —— 接收线程不再被阻塞。
+
 ## v1.9.1 — Alpha 媒体链路与事件循环延迟修复（2026-10-27）
 
 ### 修复
