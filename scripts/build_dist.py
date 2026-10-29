@@ -269,6 +269,56 @@ def scan_for_secrets(root):
     return hits
 
 
+# 微信媒体指纹（引用图 / 表情包）——这些是**真实账号的媒体内容标识**，
+# 与 wxid/群名/人名同属隐私，但脱敏表是从运行数据的身份字段生成的，
+# 覆盖不到藏在 docstring 里的示例值。实测 v1.9.3 出包时漏了 4 处。
+# 这里只看"字段名 + 高熵值"的特征，不硬编码任何真实串。
+MEDIA_FP_PATTERNS = [
+    # <img ... md5="32hex" ...> / cdnbigimgurl="..." / aeskey="..." / svrid
+    re.compile(r"""(?:md5|emoticonmd5)\s*[=:]\s*["\']?([0-9a-fA-F]{32})\b"""),
+    re.compile(r"""(?:cdn(?:big|mid|thumb)(?:img)?url|aeskey|cdnthumbaeskey)\s*=\s*["\']([0-9a-fA-F]{16,})["\']"""),
+    re.compile(r"""<svrid>\s*(\d{12,})\s*</svrid>"""),
+    # 标签形式：<emoticonmd5>32hex</emoticonmd5>
+    re.compile(r"""<(?:emoticon)?md5>\s*([0-9a-fA-F]{32})\s*</"""),
+    # <emojiinfo>base64...</emojiinfo>（解出来是带 token 的 CDN 直链）
+    re.compile(r"""<emojiinfo>\s*([A-Za-z0-9+/=]{24,})\s*</emojiinfo>"""),
+]
+
+# 合成/占位值放过（夹具与文档里刻意使用的样例）
+MEDIA_FP_ALLOW = ("example", "placeholder", "your", "xxx", "sample",
+                  "deadbeef", "0123456789abcdef", "<", "hex")
+
+
+def scan_media_fingerprints(root):
+    """扫自己文件里的真实媒体指纹（md5 / aeskey / cdn url / emojiinfo）。"""
+    hits = []
+    SKIP_EXT = (".pyc", ".pyd", ".dll", ".exe", ".pak", ".bin", ".faiss",
+                ".db", ".zip", ".node", ".asar", ".png", ".jpg", ".ico",
+                ".ttf", ".woff", ".woff2", ".dat", ".msi")
+    for base, dirs, fs in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if d not in ("__pycache__", ".venv", "site-packages",
+                                "node_modules")]
+        for f in fs:
+            if f.lower().endswith(SKIP_EXT):
+                continue
+            p = os.path.join(base, f)
+            try:
+                if os.path.getsize(p) > 8 * 1024 * 1024:
+                    continue
+                s = io.open(p, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            for pat in MEDIA_FP_PATTERNS:
+                for m in pat.finditer(s):
+                    frag = m.group(1)
+                    low = frag.lower()
+                    if any(w in low for w in MEDIA_FP_ALLOW):
+                        continue
+                    hits.append((os.path.relpath(p, root), frag[:50]))
+    return hits
+
+
 def version():
     with io.open(os.path.join(CODE_DIR, "VERSION"), encoding="utf-8") as f:
         return f.read().strip() or "0.0.0"
@@ -1077,6 +1127,15 @@ def main():
     else:
         log("  ✅ 硬检查通过（无本机用户名 / 绝对路径）")
 
+    # 媒体指纹兜底：md5 / aeskey / cdn url / emojiinfo
+    media_hits = scan_media_fingerprints(stage)
+    if media_hits:
+        log(f"  ❌ 媒体指纹兜底命中 {len(media_hits)} 处：")
+        for rel, frag in media_hits[:15]:
+            log(f"      {rel}  ->  {frag}")
+    else:
+        log("  ✅ 媒体指纹兜底通过（无真实 md5 / aeskey / cdn / emojiinfo）")
+
     # 密钥兜底扫描：不看字段名、只看内容特征
     secret_hits = scan_for_secrets(stage)
     if secret_hits:
@@ -1087,9 +1146,10 @@ def main():
         log("  ✅ 密钥兜底扫描通过（无 sk- / nvapi- / Bearer 等真实密钥）")
 
     prune_empty(stage)
-    if bad or hard_hits or secret_hits:
+    if bad or hard_hits or secret_hits or media_hits:
         log(f"\n❌ 仍有隐私残留（audit {bad} 文件 / 硬检查 {len(hard_hits)} 处 / "
-            f"密钥 {len(secret_hits)} 处），已中止出包。")
+            f"密钥 {len(secret_hits)} 处 / 媒体指纹 {len(media_hits)} 处），"
+            f"已中止出包。")
         return 1
 
     # ---------- BUILD_INFO（必须写在打包**之前**，否则不进 zip）----------

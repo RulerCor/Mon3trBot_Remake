@@ -52,9 +52,9 @@ def test_parse():
     check("kind=quote", p.kind == P.KIND_QUOTE, p.kind)
     check("text 仍是 [图片]", "[图片]" in p.text, p.text)
     check("text 不含内部 XML", "<img" not in p.text and "aeskey" not in p.text)
-    check("svrid 已解出", qi.get("svrid") == "7066182232866673373", qi.get("svrid"))
-    check("md5 已解出", qi.get("md5") == "3398762cea6e4388c6788b2ec2f2ba20", qi.get("md5"))
-    check("size 已解出", qi.get("size") == 87998, qi.get("size"))
+    check("svrid 已解出", qi.get("svrid") == "7000000000000000001", qi.get("svrid"))
+    check("md5 已解出", qi.get("md5") == "0123456789abcdef0123456789abcdef", qi.get("md5"))
+    check("size 已解出", qi.get("size") == 88000, qi.get("size"))
     check("url_kind 已解出", qi.get("url_kind") == "cdnbigimgurl", qi.get("url_kind"))
     return p, raw
 
@@ -105,7 +105,7 @@ def test_delivery(parsed, raw):
     check("段数据是 base64://",
           segs and str(segs[0].get("data", {}).get("file", "")).startswith("base64://"))
     check("回查用了 svrid",
-          calls and calls[0][0].get("rawid") == "7066182232866673373",
+          calls and calls[0][0].get("rawid") == "7000000000000000001",
           str(calls[0][0]) if calls else "no call")
     # SSE 接收线程必须立刻返回（回查在网络线程里做）
     check("回查不在接收线程同步做（并发启动）",

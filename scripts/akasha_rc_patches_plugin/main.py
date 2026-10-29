@@ -470,6 +470,68 @@ def _patch_main_agent_caption_timeout():
     return ("astrbot.core.astr_main_agent", "_request_img_caption",
             f"主回复识图统一 {timeout_seconds:.0f}s 超时上限")
 
+def _patch_main_agent_caption_empty_fallback():
+    """Stop a blank caption from silently dropping the whole image.
+
+    ``_ensure_img_caption`` appends ``<image_caption>`` only when the caption
+    provider returns non-empty text, yet its ``finally`` clears
+    ``req.image_urls`` unconditionally. A provider that returns an empty
+    completion -- e.g. a reasoning model whose thinking consumes the entire
+    token budget and yields ``finish_reason=length`` -- therefore makes the
+    image vanish with no trace: the model gets neither the picture nor any
+    hint that one was attached (this is exactly how the earlier
+    ``deepseek-v4-flash-vision-exp`` "no response" manifested).
+
+    This wrapper keeps the upstream success and exception paths unchanged and
+    only fills that one gap: when a non-empty image set produced no new content
+    part at all, it appends the *same* ``[Image Captioning Failed]`` marker the
+    exception path already uses, so the model can still acknowledge the
+    attachment. Ability only added, never removed.
+    """
+    try:
+        from astrbot.core import astr_main_agent as mod
+    except Exception:
+        return None
+    original = getattr(mod, "_ensure_img_caption", None)
+    if not callable(original) or getattr(original, "_akasha_empty_fallback", False):
+        return None
+
+    async def _ensure_img_caption_guarded(*args, **kwargs):
+        req = args[1] if len(args) > 1 else kwargs.get("req")
+        had_images = bool(getattr(req, "image_urls", None))
+        before = len(getattr(req, "extra_user_content_parts", None) or [])
+        result = await original(*args, **kwargs)
+        if had_images:
+            parts = getattr(req, "extra_user_content_parts", None) or []
+            if not parts[before:]:
+                from astrbot.core.agent.message import TextPart
+                req.extra_user_content_parts.append(
+                    TextPart(text="[Image Captioning Failed]")
+                )
+                logger.warning(
+                    "[Mon3trBot补丁][主回复识图] 上游返回空描述，"
+                    "补失败标记避免图片静默丢失"
+                )
+        return result
+
+    _ensure_img_caption_guarded._akasha_empty_fallback = True
+    _ensure_img_caption_guarded.__name__ = "_ensure_img_caption"
+    mod._ensure_img_caption = _ensure_img_caption_guarded
+
+    import sys as _sys
+    for _m in list(_sys.modules.values()):
+        if _m is None:
+            continue
+        try:
+            if getattr(_m, "_ensure_img_caption", None) is original:
+                _m._ensure_img_caption = _ensure_img_caption_guarded
+        except Exception:
+            continue
+
+    return ("astrbot.core.astr_main_agent", "_ensure_img_caption",
+            "空描述不再静默丢图（补失败标记）")
+
+
 def _patch_context_budget_defaults():
     """Make skills-like schemas and bounded memory hooks upgrade-safe."""
     changed = []
@@ -1129,6 +1191,7 @@ def _patch_image_status_cache():
             ImageGenerationRuntime._sdgen_photo_available = _sdgen_photo_available
     except Exception:
         pass
+    changed = False
     original_cls = getattr(ImageCompanionPlugin, "status", None)
     if callable(original_cls) and not getattr(original_cls, "_akasha_status_cached", False):
         cache = {"ts": 0.0, "value": None}
@@ -1143,6 +1206,7 @@ def _patch_image_status_cache():
         _status_cls._akasha_status_cached = True
         _status_cls.__name__ = "status"
         ImageCompanionPlugin.status = _status_cls
+        changed = True
     for metadata in star_map.values():
         if str(getattr(metadata, "name", "") or "") != "astrbot_plugin_image_companion":
             continue
@@ -1163,10 +1227,14 @@ def _patch_image_status_cache():
             _status_inst._akasha_status_cached = True
             _status_inst.__name__ = "status"
             instance.status = _status_inst
-        return ("astrbot_plugin_image_companion.ImageCompanionPlugin", "status",
-                "生图能力探测 30s 缓存")
+            changed = True
+    if not changed:
+        # Nothing left to patch on this pass. Returning None stops the caller
+        # from re-reporting an already-applied sub-patch, which previously made
+        # the pending retry loop log the same success line once per second.
+        return None
     return ("astrbot_plugin_image_companion.ImageCompanionPlugin", "status",
-            "生图能力探测 30s 缓存（类级）")
+            "生图能力探测 30s 缓存")
 
 
 def _patch_image_sdgen_lookup_cache():
@@ -1291,6 +1359,7 @@ PATCHES = [
     ("group_caption_cache", "群图片描述缓存（避免每条图片消息阻塞 20s+）", _patch_group_chat_caption_cache),
     ("group_context_lockfree", "群上下文注入无锁化（消除跨消息锁等待）", _patch_group_context_lockfree_inject),
     ("main_agent_caption_timeout", "主回复识图统一超时上限（防单条回复卡 1~2 分钟）", _patch_main_agent_caption_timeout),
+    ("main_agent_caption_empty_fallback", "空描述不再静默丢图（补失败标记）", _patch_main_agent_caption_empty_fallback),
 ]
 # These targets load after the patch plugin; retry them from on_plugin_loaded.
 LATE_PATCH_KEYS = {
@@ -1301,6 +1370,7 @@ LATE_PATCH_KEYS = {
     "group_caption_cache",
     "group_context_lockfree",
     "main_agent_caption_timeout",
+    "main_agent_caption_empty_fallback",
 }
 
 
@@ -1344,28 +1414,45 @@ class AkashaPatchesPlugin(Star):
         logger.info("=" * 56)
 
     def _apply_hotpath_patch(self):
-        """Apply the hot-path patch once every cooperating plugin is loaded."""
+        """Apply the hot-path patch once every cooperating plugin is loaded.
+
+        Idempotent: the sub-patches report ``None`` once they are in place, so a
+        repeat call produces no result. Only the first effective application
+        logs a success line and only the first unsatisfied pass logs the
+        interface diagnostic, so the bounded 1 Hz retry window cannot flood the
+        log with identical lines.
+        """
+        was_applied = HOTPATH_PATCH_KEY in self.applied
         result = _patch_event_loop_hotpaths()
         if not result:
+            if was_applied:
+                # Everything this pass can patch is already in place; stop the
+                # bounded retry window instead of idling for its full duration.
+                _HOTPATH_PENDING_PATCHES.discard(HOTPATH_PATCH_KEY)
+                return self.applied.get(HOTPATH_PATCH_KEY)
             # Diagnose the exact late-binding blocker so this cannot silently
-            # regress to the previous "waiting forever" state.
-            api = _find_private_companion_api()
-            image_api = getattr(api, "_image_companion_api_fresh", None)
-            try:
-                image = image_api() if callable(image_api) else None
-            except Exception as exc:
-                image = None
-                logger.warning(f"[Mon3trBot补丁][事件循环热路径] Image API 解析失败: {type(exc).__name__}: {exc}")
-            logger.info(
-                "[Mon3trBot补丁][事件循环热路径] 目标接口状态: "
-                f"private_api={'ready' if api is not None else 'pending'} "
-                f"image_runtime={'ready' if image is not None else 'pending'}"
-            )
+            # regress to the previous "waiting forever" state. Emit at most one
+            # diagnostic per activation window to avoid a per-second spam.
+            if not getattr(self, "_hotpath_diag_logged", False):
+                self._hotpath_diag_logged = True
+                api = _find_private_companion_api()
+                image_api = getattr(api, "_image_companion_api_fresh", None)
+                try:
+                    image = image_api() if callable(image_api) else None
+                except Exception as exc:
+                    image = None
+                    logger.warning(f"[Mon3trBot补丁][事件循环热路径] Image API 解析失败: {type(exc).__name__}: {exc}")
+                logger.info(
+                    "[Mon3trBot补丁][事件循环热路径] 目标接口状态: "
+                    f"private_api={'ready' if api is not None else 'pending'} "
+                    f"image_runtime={'ready' if image is not None else 'pending'}"
+                )
             return None
         self.applied[HOTPATH_PATCH_KEY] = result
         if int(result[3]) >= 2:
             _HOTPATH_PENDING_PATCHES.discard(HOTPATH_PATCH_KEY)
-        logger.info(f"  ✅ 事件循环热路径：SDGen 发现缓存与 REQ-041 快照异步化 → {result[2]}")
+        if not was_applied:
+            logger.info(f"  ✅ 事件循环热路径：SDGen 发现缓存与 REQ-041 快照异步化 → {result[2]}")
         return result
 
     @event_filter.on_plugin_loaded()
@@ -1389,6 +1476,7 @@ class AkashaPatchesPlugin(Star):
             ("group_caption_cache", _patch_group_chat_caption_cache),
             ("group_context_lockfree", _patch_group_context_lockfree_inject),
             ("main_agent_caption_timeout", _patch_main_agent_caption_timeout),
+            ("main_agent_caption_empty_fallback", _patch_main_agent_caption_empty_fallback),
         ):
             try:
                 _result = _fn()

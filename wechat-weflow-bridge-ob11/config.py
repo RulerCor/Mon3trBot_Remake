@@ -229,6 +229,16 @@ QUOTE_IMAGE_SEARCH_PAGES = max(1, int(config.get("quote_image_search_pages", 2))
 # 窗口重叠；只有上游异常慢时才会真的等到这个上限，超时就只发文字。
 QUOTE_IMAGE_FETCH_TIMEOUT = float(config.get("quote_image_fetch_timeout", 20))
 
+# 「空内容」事件回查（2026-10-30）：Alpha 的独立图片消息在 SSE 里只有
+# content=""，不带 type/media/refs。收到这类事件时按 rawid 回查历史补全，
+# 再决定是图片还是真的要丢弃。回查在后台线程做，不阻塞消息接收。
+#   - attempts：最多查几次（SSE 是实时的，历史库可能刚写入，需要重试）
+#   - delay：两次查询之间等多久（秒）
+#   - concurrency：同时进行的回查上限（图片扎堆时保护 /api/v1/messages）
+EMPTY_CONTENT_LOOKUP_ATTEMPTS = max(1, int(config.get("empty_content_lookup_attempts", 3)))
+EMPTY_CONTENT_LOOKUP_DELAY = max(0.2, float(config.get("empty_content_lookup_delay", 1.5)))
+EMPTY_CONTENT_LOOKUP_CONCURRENCY = max(1, int(config.get("empty_content_lookup_concurrency", 4)))
+
 # ============ 日志 ============
 
 # 文件日志必须带日期：bridge.log 只追加不滚动，跨天的行混在一起时

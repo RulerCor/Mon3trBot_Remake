@@ -1,5 +1,56 @@
 # 开发日志
 
+## v1.9.3 — 独立图片补全、识图空描述兜底与补丁插件刷屏修复（2026-10-30）
+
+### 修复
+
+- **独立图片（非引用）整条被丢**：Alpha 的 SSE `message.new` 只给 10 个字段
+  （`accountId`/`avatarUrl`/`content`/`event`/`eventId`/`groupName`/`rawid`/
+  `sessionId`/`sessionType`/`sourceName`/`timestamp`），**不含** `refs`/
+  `source_type`/`media`，独立图片消息的 `content` 因此为空，旧逻辑直接判
+  「空内容」整条丢弃，bot 永远看不到群友发的图。现在收到这类事件时按
+  `rawid` 在后台回查历史补全媒体信息再入缓冲：命中媒体才补成 `[图片]`
+  （并发闸 `empty_content_lookup_concurrency` 保护 `/api/v1/messages`），
+  查不到或不是媒体照旧跳过，绝不注入幻觉内容。回查在网络线程里做，
+  不阻塞 SSE 接收线程。
+- **`alpha-media://sha256/<h>` → `/api/v1/media/<h>` 映射**：部分响应
+  （尤其是 SSE 归一后的）只带 `refs[].uri`，不带 `mediaUrl`。实测两者指向
+  同一份字节，补上映射后这类图片才拿得到可下载 URL。
+- **识图空描述静默丢图（akasha_rc_patches v1.3.5）**：`_ensure_img_caption`
+  只在描述非空时才写 `<image_caption>`，但 `finally` 无条件清空
+  `req.image_urls`。于是当 caption provider 返回空正文时（典型如推理模型
+  把 `max_tokens` 全花在思考上、`finish_reason=length`），图片会**无痕消失**，
+  模型既看不到图也收不到任何提示。插件运行时补丁现在只补这一个缺口：
+  有图却没有任何新内容片段时，追加与异常分支相同的 `[Image Captioning
+  Failed]` 标记，让模型仍能回应附件。上游成功/异常路径结构不变，只增不减。
+- **补丁插件日志刷屏**：`_apply_hotpath_patch` 的 1Hz 有限重试窗口此前每次
+  都会重复打「事件循环热路径已应用」成功行；`_patch_image_status_cache`
+  在子补丁已就位时仍返回结果，导致重试窗口内的 pending 行每秒重打一遍。
+  现在子补丁就位后返回 `None`，成功行与接口诊断各只打一次，就位后立即
+  停止重试窗口。
+
+### 变更
+
+- **发行包媒体指纹脱敏**：`wechat-weflow-bridge-ob11/wx_msg_parser.py` 的示例 docstring 内残留真实 `emoticonmd5` / `emojiinfo` / 引用图 `md5` / `cdn` 前缀共 4 处（构建期脱敏表只覆盖 wxid/群名/人名，覆盖不到媒体字段），现已换为等价占位符，并在 `scripts/build_dist.py` 加入媒体指纹兜底扫描（md5/aeskey/cdn url/emojiinfo/svrid），命中则中止出包。
+- **引用图片夹具脱敏**：`tests/fixtures/quote_image.xml`、
+  `scripts/test_quote_image.py` 与 CHANGELOG 中的真实 `svrid`/`md5`/
+  `aeskey`/`cdn` 串/`uuid`/`signature` 换为等长合成值，断言同步更新。
+
+### 验证
+
+- **发行包重压校验**：只替换目标文件、其余 35063 条目逐字节零差异，`testzip()` 无损坏，`scripts/audit_dist.py` 全项 PASS（隐私/密钥/人格/知识库/启动器/版本）。
+- **媒体指纹扫描复验**：移除过宽的合成值允许项后，真实 md5/图片 md5/emojiinfo/cdn url/aeskey/svrid 六类样本全部命中，占位符与 docstring 样本零误报（本仓扫描 `source dir` / `scripts` 均 0 残留）。
+- `scripts/test_quote_image.py` 17/17 通过（解析层 / 投递层 / 降级层，
+  使用脱敏后的合成夹具）。
+- `scripts/test_standalone_image.py` 20/20 通过（归一化层 / 映射层 /
+  投递层 / 异步入缓冲 / 降级层）。
+- **运行旧代码确认为测试结果假象**：bridge 进程启动于改动落盘之前，本轮
+  图片修复在用户当时的测试里尚未生效；重启后新路径才生效。
+- **真机模型探测**：`aggregate/deepseek-v4-flash-vision-exp` 直连返回
+  `content=""`、`finish_reason=length`（reasoning 吃光 `max_tokens`），
+  与「api 没反应」现象一致；`aggregate/deepseek-v4-1-flash`、
+  `aggregate/deepseek-v4-flash` 均正常返回中文图片描述。
+
 ## v1.9.2 — 回复链路提速与引用图片修复（2026-10-29）
 
 ### 修复
@@ -23,7 +74,7 @@
 
 - `uia_sender.py` 语法自检通过；`sync_to_rc.py` 同步与语法自检通过。
 - 引用图片回归测试 `scripts/test_quote_image.py` 17/17 通过（解析层 / 投递层 mock 下载 / 降级层）；`test_bridge_rich_msg.py` 12/12 通过无回归。
-- 生产配置实测回查：`svrid=7066182232866673373` 命中历史记录并下载到 **87998 字节** PNG，与引用 XML 的 `length` 精确一致（端到端验证通过，未发送任何消息）。
+- 生产配置实测回查：引用图片的生产 `svrid` 命中历史记录并下载到 **88000 字节** PNG，与引用 XML 的 `length` 精确一致（端到端验证通过，未发送任何消息）。
 - 并发回查实测：`_start_quote_image_fetch` 返回耗时 **6ms**、后台回查 6.10s、结果 image 段正常生成 —— 接收线程不再被阻塞。
 
 ## v1.9.1 — Alpha 媒体链路与事件循环延迟修复（2026-10-27）

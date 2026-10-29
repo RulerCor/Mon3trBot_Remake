@@ -25,12 +25,55 @@ import state
 log = logging.getLogger("ob11-bridge")
 
 
+_ALPHA_MEDIA_SCHEME = "alpha-media://"
+
+
+def alpha_media_uri_to_url(uri: str) -> str:
+    """把 `alpha-media://sha256/<hash>` 映射成可下载的 `/api/v1/media/<hash>`。
+
+    实测（2026-10-30）：二者指向同一份字节，带 Bearer 的
+    `GET /api/v1/media/<hash>` 返回 200 + 图片；
+    `/api/v1/media/sha256/<hash>`、`?hash=`、`?uri=` 全部 404。
+    有些响应（尤其是 SSE 归一后的）只带 refs.uri，不带 mediaUrl，
+    这个映射是唯一的可下载入口。
+    """
+    if not uri or not uri.startswith(_ALPHA_MEDIA_SCHEME):
+        return ""
+    rest = uri[len(_ALPHA_MEDIA_SCHEME):]
+    if rest.startswith("sha256/"):
+        rest = rest[len("sha256/"):]
+    rest = rest.strip("/")
+    if not rest:
+        return ""
+    return f"/api/v1/media/{rest}"
+
+
+def _first_media_mime(item: dict) -> str:
+    """从 media.resources / refs 里取第一个 mime 类型（兼容 camel/snake）。"""
+    if not isinstance(item, dict):
+        return ""
+    media = item.get("media")
+    if isinstance(media, dict):
+        for res in media.get("resources") or []:
+            if isinstance(res, dict):
+                mime = str(res.get("mimeType") or res.get("mime_type") or "").lower()
+                if mime:
+                    return mime
+    for ref in item.get("refs") or []:
+        if isinstance(ref, dict):
+            mime = str(ref.get("mime_type") or ref.get("mimeType") or "").lower()
+            if mime:
+                return mime
+    return ""
+
+
 def extract_media_url(item: dict) -> str:
     """从 Alpha 历史/SSE 消息中提取可下载媒体 URL。
 
     Alpha 0.2.0 的 `/api/v1/messages` 在不同阶段会返回：
       - 旧兼容字段：`mediaUrl`
       - 新结构：`media.resources[].url`
+      - 仅引用：`refs[].uri`（`alpha-media://sha256/<h>`）
     只把已 resolve 的资源当作可用图片，避免把 unresolved 占位资源
     交给下载层后误报“取图失败”。
     """
@@ -42,17 +85,24 @@ def extract_media_url(item: dict) -> str:
             return value
 
     media = item.get("media")
-    if not isinstance(media, dict):
-        return ""
-    for res in media.get("resources") or []:
-        if not isinstance(res, dict):
+    if isinstance(media, dict):
+        for res in media.get("resources") or []:
+            if not isinstance(res, dict):
+                continue
+            status = str(res.get("status") or "").lower()
+            if status and status != "resolved":
+                continue
+            value = str(res.get("url") or res.get("mediaUrl") or res.get("media_url") or "")
+            if value:
+                return value
+
+    # 兜底：refs[].uri。有些响应只给 refs，不给 mediaUrl / media.resources。
+    for ref in item.get("refs") or []:
+        if not isinstance(ref, dict):
             continue
-        status = str(res.get("status") or "").lower()
-        if status and status != "resolved":
-            continue
-        value = str(res.get("url") or res.get("mediaUrl") or res.get("media_url") or "")
-        if value:
-            return value
+        mapped = alpha_media_uri_to_url(str(ref.get("uri") or ""))
+        if mapped:
+            return mapped
     return ""
 
 
@@ -69,7 +119,13 @@ def extract_message_id(item: dict) -> str:
 
 
 def infer_event_type(item: dict) -> int:
-    """从 Alpha 消息字段推断微信原生类型码，兼容 snake_case。"""
+    """从 Alpha 消息字段推断微信原生类型码，兼容 snake_case。
+
+    字段来源可能有三套：`type/msgType/sourceType`（camel）、
+    `source_type`（snake）、以及只有 `media.resources[].mime_type` /
+    `refs[].kind|mime_type` 的引用形态。只认其中一套会让图片事件
+    变成 `type=0` + 空正文，最后被当「空内容」丢掉。
+    """
     if not isinstance(item, dict):
         return 0
     for key in ("type", "msgType", "sourceType", "source_type"):
@@ -81,20 +137,35 @@ def infer_event_type(item: dict) -> int:
         if number:
             return number
 
-    # 某些历史记录只给 kind=media + mimeType，没有 source_type。
-    media = item.get("media")
-    mime = ""
-    if isinstance(media, dict):
-        for res in media.get("resources") or []:
-            if isinstance(res, dict) and res.get("mimeType"):
-                mime = str(res.get("mimeType") or "").lower()
-                break
+    # media 资源 / refs 的 mime（兼容 mimeType 与 mime_type）
+    mime = _first_media_mime(item)
     if mime.startswith("image/"):
         return 3
     if mime.startswith("video/"):
         return 43
     if mime.startswith("audio/"):
         return 34
+
+    # 只有 kind 没有 mime 的形态（实测 kind ∈ media/image/video/voice）
+    kind = str(item.get("kind") or "").lower()
+    if kind == "image":
+        return 3
+    if kind == "video":
+        return 43
+    if kind in ("voice", "audio"):
+        return 34
+
+    # refs[].kind 兜底
+    for ref in item.get("refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        rkind = str(ref.get("kind") or "").lower()
+        if rkind == "image":
+            return 3
+        if rkind == "video":
+            return 43
+        if rkind in ("voice", "audio"):
+            return 34
     return 0
 
 

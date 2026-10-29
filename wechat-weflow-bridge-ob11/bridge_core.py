@@ -135,6 +135,10 @@ class WeFlowBridge:
         self._pending_image = {}            # talkerId → {"caption": None|str, "event": threading.Event()}
         self._skip_stat = {}                # (会话, 成员, 原因) → {"count": n, "last": ts}
         self._skip_lock = threading.Lock()
+        # 「空内容」事件（Alpha 独立图片在 SSE 里只有 content=""）的历史
+        # 回查并发闸：图片会扎堆到达，不限制会同时打满 /api/v1/messages。
+        self._empty_lookup_sem = threading.Semaphore(
+            max(1, int(getattr(config, "EMPTY_CONTENT_LOOKUP_CONCURRENCY", 4))))
 
     # ============ 内部工具 ============
 
@@ -942,7 +946,14 @@ class WeFlowBridge:
                             self.processed_ids.discard(_old)
                         del self._processed_order[:2500]
                     ignore_reason = self.ignore_reason(data)
-                    if ignore_reason:
+                    if ignore_reason == "空内容" and data.get("rawid"):
+                        # Alpha 的独立图片消息在 SSE 里只有 content=""，不带
+                        # type/media/refs（实测 2026-10-30：message.new 仅 10 个
+                        # 字段）。直接判「空内容」会把所有非引用图片永久丢掉。
+                        # 改成后台回查历史补全媒体信息后再入缓冲 —— 网络 I/O
+                        # 不落在接收线程上，接收循环不被拖慢。
+                        self._hydrate_empty_event_async(data)
+                    elif ignore_reason:
                         self._log_skip(data, ignore_reason)
                     else:
                         # 展示名优先用归一后的 senderName；私聊仍是 sourceName。
@@ -961,6 +972,106 @@ class WeFlowBridge:
                 log.error(f"SSE 异常: {e}")
         finally:
             self._sse_session = None
+
+    # ============ 「空内容」事件补全（Alpha 独立图片） ============
+
+    def _hydrate_empty_event_async(self, data):
+        """把 content="" 的事件丢进后台线程回查历史补全，不阻塞接收线程。"""
+        if not data.get("rawid"):
+            self._log_skip(data, "空内容")
+            return
+        threading.Thread(target=self._hydrate_empty_event_worker,
+                         args=(dict(data),), daemon=True).start()
+
+    def _hydrate_empty_event_worker(self, data):
+        """后台：按 rawid 回查历史，补全成 [图片]/[视频]/[语音] 后再入缓冲。
+
+        找不到或不是媒体 → 退回原来的「空内容」跳过（行为与改动前一致，
+        只是多打了一条日志，能力只增不减）。
+        """
+        try:
+            enriched = self._hydrate_empty_event(data)
+        except Exception as e:
+            log.warning(f"空内容事件回查异常: {e}")
+            enriched = None
+        if not enriched:
+            self._log_skip(data, "空内容")
+            return
+        reason = self.ignore_reason(enriched)
+        if reason:
+            self._log_skip(enriched, reason)
+            return
+        shown = (enriched.get("senderName") or enriched.get("sourceName") or "")
+        log.info(f"📩 空内容事件已由历史补全: {shown} → {enriched.get('content','')[:50]}")
+        self.add_to_buffer(enriched)
+
+    def _hydrate_empty_event(self, data):
+        """按 rawid 回查历史，返回补全后的事件；找不到返回 None。
+
+        为什么要重试：SSE 是实时的，历史库可能还没写入这条消息。
+        有限次重试足以覆盖这点写入延迟，且只在本条事件上等待。
+        """
+        rawid = str(data.get("rawid") or "").strip()
+        talker = str(data.get("sessionId") or data.get("conversation_id") or "").strip()
+        if not rawid or not talker:
+            return None
+        attempts = max(1, int(getattr(config, "EMPTY_CONTENT_LOOKUP_ATTEMPTS", 3)))
+        delay = float(getattr(config, "EMPTY_CONTENT_LOOKUP_DELAY", 1.5))
+        source = create_message_source()
+        with self._empty_lookup_sem:
+            for attempt in range(attempts):
+                if attempt:
+                    time.sleep(delay)
+                try:
+                    payload = source.fetch_messages(
+                        talker, limit=50, media=True, order="desc")
+                except Exception as e:
+                    log.debug(f"空内容回查第 {attempt + 1} 次失败: {e}")
+                    continue
+                messages = payload if isinstance(payload, list) else payload.get(
+                    "messages", payload.get("data", []))
+                if not isinstance(messages, list):
+                    continue
+                for m in messages:
+                    if not isinstance(m, dict):
+                        continue
+                    if str(extract_message_id(m)) != rawid:
+                        continue
+                    enriched = self._enrich_from_history(data, source, m)
+                    if enriched is not None:
+                        return enriched
+        return None
+
+    # 只认这几类媒体占位符：SSE 说 content="" 的事件，历史必须也确实
+    # 指向一条媒体消息才补全。否则宁可维持「空内容跳过」，绝不把一条
+    # 意料之外的文本注入上下文。
+    _HYDRATE_CONTENT_OK = ("[图片]", "[视频]", "[语音]")
+
+    def _enrich_from_history(self, data, source, m):
+        """把历史消息里的媒体字段并回 SSE 事件，保留 SSE 的身份/会话元数据。
+
+        只在历史确实认出媒体时才返回结果；文本/无法识别一律返回 None。
+        """
+        norm = source.normalize_event(m)
+        content = str(norm.get("content") or "")
+        # 占位符只可能来自「source_type 是媒体」或「带媒体 mime/refs」
+        # （见 message_source.infer_event_type），所以这里再用占位符白名单
+        # 收一次口，纯文本 / 未知类型一律不补全。
+        if content not in self._HYDRATE_CONTENT_OK:
+            return None
+        enriched = dict(data)
+        enriched["content"] = content
+        if norm.get("_alphaMediaUrl"):
+            enriched["_alphaMediaUrl"] = norm["_alphaMediaUrl"]
+        if norm.get("_alphaRawContent"):
+            enriched.setdefault("_alphaRawContent", norm["_alphaRawContent"])
+        # SSE 事件里有群名/头像等元数据；历史里没有就保持 SSE 原值。
+        for key in ("groupName", "avatarUrl", "sessionType"):
+            if not enriched.get(key) and norm.get(key):
+                enriched[key] = norm[key]
+        # 强制用 SSE 的 rawid，避免归一后取到内部 id 破坏去重。
+        enriched["rawid"] = str(data.get("rawid") or "")
+        return enriched
 
     def _fetch_image_base64(self, data, max_pages: int = 1) -> str | None:
         """取得图片字节并返回 base64。

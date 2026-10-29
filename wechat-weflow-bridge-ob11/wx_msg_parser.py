@@ -1,4 +1,4 @@
-﻿"""微信消息统一解析层（方案 B）。
+"""微信消息统一解析层（方案 B）。
 
 ## 为什么需要它
 
@@ -41,11 +41,11 @@ WeFlow 推来的微信消息里，非文本类型的 `content` 是一坨**微信
 
     <appmsg><type>8</type>
       <appattch>
-        <emoticonmd5>40ac0a2bf0bf7825a6ad849947801b25</emoticonmd5>
+        <emoticonmd5><emoticon-md5></emoticonmd5>
         <totallen>1168271</totallen>
         <fileext>pic</fileext>
       </appattch>
-      <emojiinfo>CiA0MGFjMGEy...（base64，内含 CDN 下载直链）</emojiinfo>
+      <emojiinfo>（base64，内含 CDN 下载直链）</emojiinfo>
     </appmsg>
 
 下载 `emojiinfo` 里解出的 URL：HTTP 200、1168271 字节（与 `<totallen>` 一致）、
@@ -323,8 +323,8 @@ def _extract_quote_image_meta(quote_text: str, refer_raw: str = "") -> dict:
 
         wxid_xxx:
         <?xml version="1.0"?>
-        <msg><img aeskey="..." cdnbigimgurl="305f02..." length="87998"
-                  md5="3398762cea..." ...></msg>
+        <msg><img aeskey="..." cdnbigimgurl="<hex>..." length="87998"
+                  md5="<hex>..." ...></msg>
 
     旧的 `_parse_quote` 只判断 `re.search(r"<img\b")` 就写死
     `[图片]`，md5 / length / svrid 全部丢掉 —— 结果桥接无法回查下载，
