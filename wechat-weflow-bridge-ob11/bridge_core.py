@@ -129,6 +129,10 @@ class WeFlowBridge:
         self.chat_histories = defaultdict(list)
         self.contact_map = {}
         self._sse_session = None
+        self._roster_thread = None
+        self._roster_thread_lock = threading.Lock()
+        self._roster_prefetch_thread = None
+        self._roster_prefetch_lock = threading.Lock()
         self._recent_seen = {}
         self._sent_recently = {}
         self._sse_event_keys = {}
@@ -311,7 +315,10 @@ class WeFlowBridge:
         面板「群里管什么」表也不会出现它（2026-10-07 用户报障）。
         """
         while state.running:
-            time.sleep(600)
+            # Use an Event so shutdown does not wait for the full interval and
+            # reconnect loops never accumulate long-lived refresh threads.
+            if state.stop_event.wait(600):
+                break
             if not state.running:
                 break
             try:
@@ -890,7 +897,7 @@ class WeFlowBridge:
 
         try:
             self._sse_session = requests.get(
-                sse_url, headers=headers, stream=True, timeout=None)
+                sse_url, headers=headers, stream=True, timeout=(10, 75))
             if self._sse_session.status_code != 200:
                 # 只打 code，不打 body —— 有些后端会把 token/内部路径回显在错误里。
                 log.error(f"连接失败: HTTP {self._sse_session.status_code}")
@@ -900,8 +907,32 @@ class WeFlowBridge:
             # 群名册在后台线程拉取（可能要跑几十秒），不阻塞消息循环。
             # Alpha 群消息 sourceName 是 wxid，必须先有名册才能解析成昵称；
             # 名册未就绪期间消息**不会被丢**，只是暂时显示 wxid。
-            threading.Thread(target=self._prefetch_group_rosters, daemon=True).start()
-            threading.Thread(target=self._roster_refresh_loop, daemon=True).start()
+            with self._roster_thread_lock:
+                if self._roster_thread is None or not self._roster_thread.is_alive():
+                    self._roster_thread = threading.Thread(
+                        target=self._roster_refresh_loop,
+                        daemon=True,
+                        name="roster-refresh",
+                    )
+                    self._roster_thread.start()
+            with self._roster_prefetch_lock:
+                if (
+                    self._roster_prefetch_thread is None
+                    or not self._roster_prefetch_thread.is_alive()
+                ):
+                    def _prefetch_once():
+                        try:
+                            self._prefetch_group_rosters()
+                        finally:
+                            with self._roster_prefetch_lock:
+                                self._roster_prefetch_thread = None
+
+                    self._roster_prefetch_thread = threading.Thread(
+                        target=_prefetch_once,
+                        daemon=True,
+                        name="roster-prefetch",
+                    )
+                    self._roster_prefetch_thread.start()
 
             # SSE 是「event: xxx / data: {...}」成对出现的；
             # Alpha 的 stream.error 会主动断开连接，WeFlow 也有非 message 事件。
@@ -971,7 +1002,13 @@ class WeFlowBridge:
             if state.running:
                 log.error(f"SSE 异常: {e}")
         finally:
+            session = self._sse_session
             self._sse_session = None
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     # ============ 「空内容」事件补全（Alpha 独立图片） ============
 

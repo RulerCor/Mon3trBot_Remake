@@ -20,6 +20,9 @@ from typing import Optional
 # ============ 状态控制 ============
 
 running = False
+# Set by shutdown so long-running background waits can exit promptly.
+stop_event = threading.Event()
+stop_event.clear()
 paused = threading.Event()
 paused.clear()
 run_lock = threading.Lock()

@@ -1,5 +1,21 @@
 # 开发日志
 
+## v1.9.4 — 引用图识图恢复、SSE 重连收敛与钩子耗时治理（2026-10-30）
+
+### 修复
+
+- **引用图片拿不到具体内容（akasha_rc_patches v1.3.5）**：引用识图 guard 旧实现用代理对象包住 caption Provider，导致上游 `isinstance(provider, Provider)` 校验失败，识图请求根本没有执行。现在保留真实 Provider 身份，仅在调用期间原位包装并恢复其 `text_chat`；成功描述正常追加，超时、异常或空描述则明确写入 `[Quoted Image Caption Unavailable]`，引用原文始终保留，且并发/嵌套调用不会泄漏临时包装。
+- **SSE 重连时线程堆积**：SSE 请求增加连接/读取超时并在退出时显式关闭 session；roster refresh 改为可中断 `stop_event.wait(600)`，roster refresh 与 roster prefetch 均增加单实例锁，重连时不再重复堆后台线程，停止服务也能及时退出。
+- **长等待拖慢回复链**：保留现有记忆钩子能力与推理设置，修正摘要 provider 回退与预算路径，避免 30–60 秒无输出黑洞；system prompt 前缀保持字节级稳定以继续命中缓存。
+- **AstrNa 动画图片兼容**：兼容 AstrBot 4.29 新增的 `montage_refs` 参数，将动画帧提示转回 caption prompt，修复动画图片识图的 `TypeError`，同时保持五参数 wrapper 与重复加载幂等。
+- **Private Companion 生命周期钩子**：在插件实例尚未创建时安装延迟转发包装，实例就绪后由 AstrBot 正常绑定；修复启动早期所有后续插件加载都报缺少 `metadata` 参数的 traceback，并保持重载幂等。
+- **模型通道配置**：关闭 tokenrhythm，摘要 fallback 使用 `antie5/aggregate/deepseek-v4-1-flash`；不修改用户主模型、推理开关或群白名单。
+
+### 验证
+
+- 引用识图 guard：48/48；引用图片投递：17/17；独立图片：20/20；补丁状态：7/7。
+- v1.9.4 发布包通过完整性审计。
+
 ## v1.9.3 — 独立图片补全、识图空描述兜底与补丁插件刷屏修复（2026-10-30）
 
 ### 修复

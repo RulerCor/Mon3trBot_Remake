@@ -52,6 +52,7 @@ def _start_bridge():
         state.ob_thread = t
         state.ob_client_started = True
 
+    state.stop_event.clear()
     state.bridge_thread = threading.Thread(target=_bridge_loop, daemon=True, name="bridge")
     state.bridge_thread.start()
     log.info("[Web] 已启动")
@@ -60,6 +61,7 @@ def _start_bridge():
 def _stop_bridge():
     with state.run_lock:
         state.running = False
+        state.stop_event.set()
 
     # 切断 SSE 长连接，让 _bridge_loop 的 listen_sse() 从阻塞中退出
     with state.bridge_lock:

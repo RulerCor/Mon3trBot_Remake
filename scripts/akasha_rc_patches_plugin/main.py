@@ -29,6 +29,7 @@ scripts/check_patches.py; they are not modified by this plugin.
 
 from contextvars import ContextVar
 import asyncio
+import functools
 import hashlib
 import inspect
 import io
@@ -36,6 +37,7 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import filter as event_filter, AstrMessageEvent
@@ -301,8 +303,20 @@ def _patch_group_chat_caption_cache():
     timeout_seconds = _caption_timeout_seconds()
 
     async def get_image_caption(self, image_url, image_caption_provider_id, image_caption_prompt):
+        # ``image_url`` is usually a temporary downloaded-file path. Use the
+        # file's own bytes as the cache identity so the same picture hits even
+        # when its temporary path changes between messages.
+        try:
+            image_key = (
+                await asyncio.to_thread(
+                    lambda: hashlib.sha256(Path(image_url).read_bytes()).hexdigest()
+                )
+                if image_url else ""
+            )
+        except Exception:
+            image_key = str(image_url or "")
         key = (
-            str(image_url or ""),
+            image_key,
             str(image_caption_provider_id or ""),
             str(image_caption_prompt or ""),
         )
@@ -333,11 +347,11 @@ def _patch_group_chat_caption_cache():
             return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             logger.warning(
-                "[Mon3trBot补丁][群图片描述] 上游 %.0fs 未返回，本轮跳过描述: url=%s",
+                "[Mon3trBot补丁][群图片描述] 上游 %.0fs 未返回，补失败标记避免图片静默消失: key=%s",
                 timeout_seconds,
-                key[0][:120],
+                key[0][:16],
             )
-            raise
+            return "[Image Captioning Failed]"
 
     get_image_caption._akasha_cached = True
     get_image_caption.__name__ = "get_image_caption"
@@ -493,7 +507,9 @@ def _patch_main_agent_caption_empty_fallback():
     except Exception:
         return None
     original = getattr(mod, "_ensure_img_caption", None)
-    if not callable(original) or getattr(original, "_akasha_empty_fallback", False):
+    if not callable(original) or _akasha_callable_contains_marker(
+        original, "_akasha_empty_fallback"
+    ):
         return None
 
     async def _ensure_img_caption_guarded(*args, **kwargs):
@@ -530,6 +546,364 @@ def _patch_main_agent_caption_empty_fallback():
 
     return ("astrbot.core.astr_main_agent", "_ensure_img_caption",
             "空描述不再静默丢图（补失败标记）")
+
+
+def _patch_astrna_montage_compat():
+    """Accept AstrBot 4.29's ``montage_refs`` without editing AstrNa.
+
+    AstrBot added a sixth keyword argument to ``_ensure_img_caption`` for
+    animation frame montages. AstrNa wraps the five-argument version, so the
+    call otherwise fails with ``unexpected keyword argument 'montage_refs'``.
+    Keep AstrNa's question/quoted-text prompt enhancement intact by translating
+    the argument back into the caption prompt before calling its wrapper.
+    """
+    try:
+        from astrbot.core import astr_main_agent as mod
+    except Exception:
+        return None
+    original = getattr(mod, "_ensure_img_caption", None)
+    notice = getattr(mod, "ANIMATION_CAPTION_NOTICE", "")
+    if not callable(original) or not notice:
+        return None
+
+    marker = "_akasha_astrna_montage_compat"
+    is_astrna_wrapper = bool(
+        getattr(original, "_astrna_image_caption_patch", False)
+    )
+    if getattr(original, marker, False):
+        return None
+    # AstrNa's own wrapper must always receive this compatibility layer. For
+    # other outer wrappers, a marker anywhere in the chain proves the layer is
+    # already present and prevents repeated plugin-load events from stacking it.
+    if not is_astrna_wrapper and _akasha_callable_contains_marker(original, marker):
+        return None
+
+    async def _ensure_img_caption_with_montage(
+        event,
+        req,
+        cfg,
+        plugin_context,
+        image_caption_provider,
+        montage_refs=None,
+    ):
+        effective_cfg = cfg
+        refs = getattr(req, "image_urls", None) or []
+        indices = [
+            str(index)
+            for index, ref in enumerate(refs, start=1)
+            if ref in (montage_refs or ())
+        ]
+        if indices:
+            effective_cfg = dict(cfg or {})
+            prompt = effective_cfg.get(
+                "image_caption_prompt", "Please describe the image."
+            )
+            effective_cfg["image_caption_prompt"] = str(prompt) + notice.format(
+                indices=", ".join(indices)
+            )
+        return await original(
+            event,
+            req,
+            effective_cfg,
+            plugin_context,
+            image_caption_provider,
+        )
+
+    setattr(_ensure_img_caption_with_montage, marker, True)
+    _ensure_img_caption_with_montage.__name__ = "_ensure_img_caption"
+    mod._ensure_img_caption = _ensure_img_caption_with_montage
+    return (
+        "astrbot_plugin_AstrNa",
+        "_ensure_img_caption",
+        "AstrNa 兼容 montage_refs 并保留动画分镜提示",
+    )
+
+
+def _akasha_callable_contains_marker(
+    value, marker: str, *, seen: set[int] | None = None, depth: int = 0
+) -> bool:
+    """Return whether a wrapper closure already contains our marked callable."""
+    if not callable(value):
+        return False
+    if getattr(value, marker, False):
+        return True
+    if depth >= 4:
+        return False
+    seen = seen if seen is not None else set()
+    value_id = id(value)
+    if value_id in seen:
+        return False
+    seen.add(value_id)
+    # functools.wraps and third-party decorators expose the wrapped callable
+    # here without putting it in a closure. ``partial`` keeps it in ``func``.
+    wrapped = getattr(value, "__wrapped__", None)
+    if callable(wrapped) and _akasha_callable_contains_marker(
+        wrapped, marker, seen=seen, depth=depth + 1
+    ):
+        return True
+    if isinstance(value, functools.partial):
+        if callable(value.func) and _akasha_callable_contains_marker(
+            value.func, marker, seen=seen, depth=depth + 1
+        ):
+            return True
+        for captured in value.args:
+            if callable(captured) and _akasha_callable_contains_marker(
+                captured, marker, seen=seen, depth=depth + 1
+            ):
+                return True
+        for captured in value.keywords.values():
+            if callable(captured) and _akasha_callable_contains_marker(
+                captured, marker, seen=seen, depth=depth + 1
+            ):
+                return True
+    try:
+        cells = getattr(value, "__closure__", None) or ()
+    except Exception:
+        return False
+    for cell in cells:
+        try:
+            captured = cell.cell_contents
+        except Exception:
+            continue
+        if callable(captured) and _akasha_callable_contains_marker(
+            captured, marker, seen=seen, depth=depth + 1
+        ):
+            return True
+    return False
+
+
+def _patch_main_agent_quote_caption_guard():
+    """Bound only the quoted-image caption call and keep quoted text intact.
+
+    ``_process_quote_message`` first extracts the quoted text and then calls
+    the caption provider directly. Bounding the whole function would discard
+    that already-extracted text on timeout, so this patch supplies a small
+    context proxy that bounds only ``Provider.text_chat``. On timeout, provider
+    error, or an empty completion it returns the same visible failure marker
+    the normal image path uses. AstrNa's context proxy and prompt rewriting stay
+    in the chain unchanged.
+
+    AstrNa wraps ``_process_quote_message`` after this plugin loads. The marker
+    walker prevents a duplicate guard when that wrapper is seen again.
+    """
+    try:
+        from astrbot.core import astr_main_agent as mod
+    except Exception:
+        return None
+    original = getattr(mod, "_process_quote_message", None)
+    if not callable(original):
+        return None
+    guard_marker = "_akasha_quote_caption_guard"
+    if getattr(original, guard_marker, False) or _akasha_callable_contains_marker(
+        original, guard_marker
+    ):
+        return None
+
+    failure_marker = "[Quoted Image Caption Unavailable]"
+    timeout_seconds = _caption_timeout_seconds()
+
+    class _CaptionFailure:
+        def __init__(self, text: str):
+            self.completion_text = text
+
+    active_patches = {}
+
+    class _BoundedQuoteProvider:
+        """Temporarily bound one real provider without replacing its identity.
+
+        Upstream checks ``isinstance(prov, Provider)`` and AstrNa patches the
+        same provider instance. Returning a proxy would break both contracts,
+        so we patch ``text_chat`` in place for the duration of the call and
+        restore it in ``finally``.
+        """
+
+        def __init__(self, provider):
+            self._akasha_provider = provider
+
+        def __enter__(self):
+            provider = self._akasha_provider
+            if provider is None:
+                return self
+            provider_id = id(provider)
+            state = active_patches.get(provider_id)
+            if state is not None:
+                state["ref_count"] += 1
+                return self
+            state = {
+                "provider": provider,
+                "had_instance_text_chat": "text_chat"
+                in getattr(provider, "__dict__", {}),
+                "original": provider.text_chat,
+                "ref_count": 1,
+            }
+            active_patches[provider_id] = state
+
+            async def _bounded_text_chat(*args, **kwargs):
+                budget = _caption_timeout_seconds()
+                started = time.monotonic()
+                provider_name = str(
+                    getattr(provider, "provider_id", "")
+                    or getattr(provider, "id", "")
+                    or type(provider).__name__
+                )
+                try:
+                    result = await asyncio.wait_for(
+                        state["original"](*args, **kwargs),
+                        timeout=budget,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[Mon3trBot补丁][引用识图] 上游 %.0fs 未返回，"
+                        "保留引用文字并补失败标记（provider=%s）",
+                        budget,
+                        provider_name,
+                    )
+                    return _CaptionFailure(failure_marker)
+                except Exception as exc:
+                    logger.warning(
+                        "[Mon3trBot补丁][引用识图] 失败，保留引用文字并补失败标记"
+                        "（provider=%s，耗时 %.0fms，%s）",
+                        provider_name,
+                        (time.monotonic() - started) * 1000,
+                        type(exc).__name__,
+                    )
+                    return _CaptionFailure(failure_marker)
+
+                caption = str(getattr(result, "completion_text", "") or "").strip()
+                if caption:
+                    logger.debug(
+                        "[Mon3trBot补丁][引用识图] 成功（provider=%s，耗时 %.0fms）",
+                        provider_name,
+                        (time.monotonic() - started) * 1000,
+                    )
+                    return result
+                logger.warning(
+                    "[Mon3trBot补丁][引用识图] 上游返回空描述，"
+                    "保留引用文字并补失败标记（provider=%s，耗时 %.0fms）",
+                    provider_name,
+                    (time.monotonic() - started) * 1000,
+                )
+                return _CaptionFailure(failure_marker)
+
+            state["wrapper"] = _bounded_text_chat
+            setattr(provider, "text_chat", _bounded_text_chat)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            provider = self._akasha_provider
+            if provider is None:
+                return False
+            provider_id = id(provider)
+            state = active_patches.get(provider_id)
+            if state is None:
+                return False
+            state["ref_count"] -= 1
+            if state["ref_count"] > 0:
+                return False
+            active_patches.pop(provider_id, None)
+            if getattr(provider, "text_chat", None) is state["wrapper"]:
+                if state["had_instance_text_chat"]:
+                    setattr(provider, "text_chat", state["original"])
+                else:
+                    try:
+                        delattr(provider, "text_chat")
+                    except AttributeError:
+                        pass
+            return False
+
+    class _BoundedQuoteContext:
+        """Patch only providers returned to one quote-processing call."""
+
+        def __init__(self, plugin_context):
+            self._akasha_plugin_context = plugin_context
+            self._patched_providers = []
+
+        def __getattr__(self, name):
+            return getattr(self._akasha_plugin_context, name)
+
+        def _patch_provider(self, provider):
+            if provider is not None:
+                bound = _BoundedQuoteProvider(provider)
+                bound.__enter__()
+                self._patched_providers.append(bound)
+            return provider
+
+        def get_provider_by_id(self, *args, **kwargs):
+            return self._patch_provider(
+                self._akasha_plugin_context.get_provider_by_id(*args, **kwargs)
+            )
+
+        def get_using_provider(self, *args, **kwargs):
+            return self._patch_provider(
+                self._akasha_plugin_context.get_using_provider(*args, **kwargs)
+            )
+
+        async def get_using_provider_async(self, *args, **kwargs):
+            provider = await self._akasha_plugin_context.get_using_provider_async(
+                *args, **kwargs
+            )
+            return self._patch_provider(provider)
+
+        def restore(self):
+            for patch in reversed(self._patched_providers):
+                patch.__exit__(None, None, None)
+            self._patched_providers.clear()
+
+    async def _process_quote_message_guarded(*args, **kwargs):
+        plugin_context = args[3] if len(args) > 3 else kwargs.get("plugin_context")
+        req = args[1] if len(args) > 1 else kwargs.get("req")
+        before_parts = len(getattr(req, "extra_user_content_parts", None) or [])
+        bounded_context = _BoundedQuoteContext(plugin_context)
+        started = time.monotonic()
+        try:
+            if len(args) > 3:
+                call_args = list(args)
+                call_args[3] = bounded_context
+                result = await original(*call_args, **kwargs)
+            elif "plugin_context" in kwargs:
+                call_kwargs = dict(kwargs)
+                call_kwargs["plugin_context"] = bounded_context
+                result = await original(*args, **call_kwargs)
+            else:
+                result = await original(*args, **kwargs)
+
+            new_parts = (getattr(req, "extra_user_content_parts", None) or [])[
+                before_parts:
+            ]
+            if result and any(
+                failure_marker in str(getattr(part, "text", "") or "")
+                for part in new_parts
+            ):
+                return None
+            return result
+        finally:
+            bounded_context.restore()
+            logger.debug(
+                "[Mon3trBot补丁][引用识图] 处理完成（耗时 %.0fms）",
+                (time.monotonic() - started) * 1000,
+            )
+
+    setattr(_process_quote_message_guarded, guard_marker, True)
+    _process_quote_message_guarded.__name__ = "_process_quote_message"
+    mod._process_quote_message = _process_quote_message_guarded
+
+    import sys as _sys
+    rebound = 0
+    for module in list(_sys.modules.values()):
+        if module is None:
+            continue
+        try:
+            if getattr(module, "_process_quote_message", None) is original:
+                module._process_quote_message = _process_quote_message_guarded
+                rebound += 1
+        except Exception:
+            continue
+
+    return (
+        "astrbot.core.astr_main_agent",
+        "_process_quote_message",
+        f"引用图识图 {timeout_seconds:.0f}s 上限，超时/空描述保留引用文字（重绑 {rebound} 处）",
+    )
 
 
 def _patch_context_budget_defaults():
@@ -1341,6 +1715,144 @@ def _patch_req041_scoped_snapshot_async():
             "_req041_sync_scoped_now", "REQ-041 快照复制移出事件循环")
 
 
+_PRIVATE_COMPANION_LIFECYCLE_DEFERRED = "_akasha_private_companion_lifecycle_deferred"
+_PRIVATE_COMPANION_NAME = "astrbot_plugin_private_companion"
+_PRIVATE_COMPANION_MODULE_SUFFIX = "astrbot_plugin_private_companion.main"
+
+
+def _find_private_companion_lifecycle_metadata():
+    """Resolve Private Companion metadata under AstrBot's import-path variants."""
+    try:
+        from astrbot.core.star.star import star_map
+    except Exception:
+        return None, set()
+
+    module_paths = set()
+    matched = None
+    for module_path, metadata in star_map.items():
+        if (
+            getattr(metadata, "name", None) == _PRIVATE_COMPANION_NAME
+            or getattr(metadata, "module_path", None) == _PRIVATE_COMPANION_MODULE_SUFFIX
+            or str(module_path).endswith(_PRIVATE_COMPANION_MODULE_SUFFIX)
+        ):
+            module_paths.add(module_path)
+            declared_path = getattr(metadata, "module_path", None)
+            if declared_path:
+                module_paths.add(declared_path)
+            matched = matched or metadata
+    return matched, module_paths
+
+
+def _resolve_private_companion_lifecycle_instance(metadata=None):
+    metadata = metadata or _find_private_companion_lifecycle_metadata()[0]
+    return getattr(metadata, "star_cls", None)
+
+
+def _make_private_companion_deferred_lifecycle(raw, metadata=None):
+    """Defer a lifecycle hook until Private Companion has an instance.
+
+    The plugin's decorated hooks are registered before its class is instantiated.
+    AstrBot emits ``on_plugin_loaded`` for earlier plugins in that window, and a
+    raw class function then fails because ``self`` is missing. Keep the real hook
+    intact but swallow that pre-instantiation call; AstrBot later binds this
+    wrapper to the live instance, after which it delegates to the original hook.
+    """
+    @functools.wraps(raw)
+    async def deferred(*args, **kwargs):
+        if len(args) >= 2:
+            return await raw(*args, **kwargs)
+        current = _resolve_private_companion_lifecycle_instance(metadata)
+        if current is None:
+            return None
+        if args:
+            return await raw(current, *args, **kwargs)
+        if kwargs:
+            return await raw(current, **kwargs)
+        return None
+
+    setattr(deferred, _PRIVATE_COMPANION_LIFECYCLE_DEFERRED, True)
+    return deferred
+
+
+def _repair_private_companion_lifecycle_bindings():
+    """Bind Private Companion lifecycle hooks to the live plugin instance.
+
+    AstrBot binds decorator handlers to ``star_cls`` while loading each plugin.
+    Private Companion's two lifecycle hooks can reach dispatch as raw functions
+    before that plugin is instantiated, which raises
+    ``missing 1 required positional argument: 'metadata'`` for every plugin
+    loaded earlier in the startup. Bind the live instance when available and
+    install a late-binding no-op/delegate wrapper during the pre-init window.
+    """
+    try:
+        from astrbot.core.star.star_handler import (
+            EventType,
+            star_handlers_registry,
+        )
+    except Exception:
+        return None
+
+    # handlers are registered by the decorator before Private Companion's
+    # metadata is inserted into ``star_map``. Match the module suffix directly
+    # so the pre-instantiation window is protected as well.
+    metadata, _module_paths = _find_private_companion_lifecycle_metadata()
+    instance = getattr(metadata, "star_cls", None)
+
+    targets = {
+        (EventType.OnPluginLoadedEvent, "_on_external_plugin_loaded"),
+        (EventType.OnPluginUnloadedEvent, "_on_external_plugin_unloaded"),
+    }
+    repaired = []
+    deferred = []
+    repaired_module_path = None
+    for handler in star_handlers_registry:
+        module_path = str(getattr(handler, "handler_module_path", "") or "")
+        if not module_path.endswith(_PRIVATE_COMPANION_MODULE_SUFFIX):
+            continue
+        if (handler.event_type, handler.handler_name) not in targets:
+            continue
+
+        current = handler.handler
+        if inspect.ismethod(current):
+            if current.__self__ is instance:
+                continue
+            raw = current.__func__
+        elif isinstance(current, functools.partial):
+            if len(current.args) == 1 and current.args[0] is instance:
+                continue
+            raw = current.func
+        elif inspect.isfunction(current):
+            raw = current
+        else:
+            continue
+        if not callable(raw):
+            continue
+        if instance is None:
+            if getattr(raw, _PRIVATE_COMPANION_LIFECYCLE_DEFERRED, False):
+                continue
+            handler.handler = _make_private_companion_deferred_lifecycle(raw, metadata)
+            deferred.append(handler.handler_name)
+            repaired_module_path = module_path
+            continue
+        handler.handler = functools.partial(raw, instance)
+        repaired.append(handler.handler_name)
+        repaired_module_path = module_path
+
+    if repaired:
+        return (
+            getattr(metadata, "module_path", None) or repaired_module_path,
+            "lifecycle_handlers",
+            f"生命周期钩子绑定当前实例（{', '.join(sorted(set(repaired)))}）",
+        )
+    if deferred:
+        return (
+            getattr(metadata, "module_path", None) or repaired_module_path,
+            "lifecycle_handlers_deferred",
+            f"生命周期钩子等待实例后转发（{', '.join(sorted(set(deferred)))}）",
+        )
+    return None
+
+
 PATCHES = [
     ("active_reply_blacklist", "主动回复黑名单运行时接管（4.29 回归修复）", _patch_active_reply_blacklist),
     ("provider_getkeys", "provider get_keys 归一化（修复 All chat models failed）", _patch_provider_getkeys),
@@ -1360,6 +1872,9 @@ PATCHES = [
     ("group_context_lockfree", "群上下文注入无锁化（消除跨消息锁等待）", _patch_group_context_lockfree_inject),
     ("main_agent_caption_timeout", "主回复识图统一超时上限（防单条回复卡 1~2 分钟）", _patch_main_agent_caption_timeout),
     ("main_agent_caption_empty_fallback", "空描述不再静默丢图（补失败标记）", _patch_main_agent_caption_empty_fallback),
+    ("astrna_montage_compat", "AstrNa 兼容 AstrBot montage_refs 参数（恢复动画图片识图）", _patch_astrna_montage_compat),
+    ("main_agent_quote_caption_guard", "引用图描述超时与空描述兜底（防引用图静默丢失）", _patch_main_agent_quote_caption_guard),
+    ("private_companion_lifecycle_bindings", "Private Companion 生命周期钩子实例绑定修复", _repair_private_companion_lifecycle_bindings),
 ]
 # These targets load after the patch plugin; retry them from on_plugin_loaded.
 LATE_PATCH_KEYS = {
@@ -1371,6 +1886,9 @@ LATE_PATCH_KEYS = {
     "group_context_lockfree",
     "main_agent_caption_timeout",
     "main_agent_caption_empty_fallback",
+    "astrna_montage_compat",
+    "main_agent_quote_caption_guard",
+    "private_companion_lifecycle_bindings",
 }
 
 
@@ -1458,6 +1976,28 @@ class AkashaPatchesPlugin(Star):
     @event_filter.on_plugin_loaded()
     async def _on_plugin_loaded(self, metadata):
         """Apply late patches after their target plugins have fully loaded."""
+        # AstrBot temporarily restores decorated handlers to raw functions
+        # while loading each external plugin, then rebinds the current instance
+        # after this hook returns. Repair on the next loop turn so that rebind
+        # has finished and our wrapper is not immediately overwritten.
+        async def _repair_after_loader_rebind():
+            await asyncio.sleep(0)
+            try:
+                result = _repair_private_companion_lifecycle_bindings()
+                if result:
+                    self.applied["private_companion_lifecycle_bindings"] = result
+                    logger.info(f"  ✅ Private Companion 生命周期钩子 → {result[2]}")
+            except Exception as e:
+                logger.error(
+                    "[Mon3trBot补丁][生命周期钩子] 修复失败："
+                    f"{type(e).__name__}: {e}"
+                )
+
+        asyncio.create_task(
+            _repair_after_loader_rebind(),
+            name="akasha-pc-lifecycle-repair",
+        )
+
         # PrivateCompanion invalidates its optional bridge caches here. Keep
         # that behavior independent of the handler-repair code below: the
         # image plugin may load before the private companion publishes its API.
@@ -1477,6 +2017,8 @@ class AkashaPatchesPlugin(Star):
             ("group_context_lockfree", _patch_group_context_lockfree_inject),
             ("main_agent_caption_timeout", _patch_main_agent_caption_timeout),
             ("main_agent_caption_empty_fallback", _patch_main_agent_caption_empty_fallback),
+            ("astrna_montage_compat", _patch_astrna_montage_compat),
+            ("main_agent_quote_caption_guard", _patch_main_agent_quote_caption_guard),
         ):
             try:
                 _result = _fn()
@@ -1515,6 +2057,26 @@ class AkashaPatchesPlugin(Star):
                 logger.info(f"  ✅ 动态 system prompt 迁移 → {result[2]}")
             except Exception as e:
                 logger.error(f"[Mon3trBot补丁][提示词缓存] 延迟接管失败：{type(e).__name__}: {e}")
+            # AstrNa installs its five-argument image-caption wrapper during
+            # initialize(). Re-apply the compatibility and safety layers after
+            # that install so the next message never enters the broken chain.
+            for _key, _fn in (
+                ("astrna_montage_compat", _patch_astrna_montage_compat),
+                ("main_agent_caption_timeout", _patch_main_agent_caption_timeout),
+                ("main_agent_caption_empty_fallback", _patch_main_agent_caption_empty_fallback),
+                ("main_agent_quote_caption_guard", _patch_main_agent_quote_caption_guard),
+            ):
+                try:
+                    result = _fn()
+                except Exception as e:
+                    logger.error(
+                        f"[Mon3trBot补丁][AstrNa兼容] {_key} 失败："
+                        f"{type(e).__name__}: {e}"
+                    )
+                else:
+                    if result:
+                        self.applied[_key] = result
+                        logger.info(f"  ✅ AstrNa 后置补丁 → {result[2]}")
         if name == HUMANIZER_PLUGIN_NAME:
             try:
                 result = _patch_humanizer_session_style()
